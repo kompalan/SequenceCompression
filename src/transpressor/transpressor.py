@@ -10,6 +10,7 @@ from .module import Transpressor
 
 import wandb
 from tqdm import tqdm
+from omegaconf import OmegaConf
 
 class ActionDataset(Dataset):
     def __init__(self, h5_file, context_length):
@@ -83,21 +84,25 @@ def compressor_forward(model, input, target, stage="train"):
 
     return output
 
-n_epochs = 1
-lr = 1e-5
-batch_size = 10
-context_length = 4
-log_to_wandb = False
+conf = OmegaConf.load("config/transpressor.yaml")
 
-transpressor_input_dim = 2
-transpressor_hidden_dim = 64
-transpressor_output_dim = 2
-transpressor_depth = 4
-transpressor_heads = 4
-transpressor_dim_head = 16
-transpressor_mlp_dim = 128
-transpressor_dropout = 0.1
-transpressor_output_proj = True
+n_epochs = conf.n_epochs
+lr = conf.lr
+batch_size = conf.batch_size
+context_length = conf.context_length
+log_to_wandb = conf.log_to_wandb
+
+transpressor_input_dim = conf.transpressor_input_dim
+transpressor_hidden_dim = conf.transpressor_hidden_dim
+transpressor_output_dim = conf.transpressor_output_dim
+transpressor_depth = conf.transpressor_depth
+transpressor_heads = conf.transpressor_heads
+transpressor_dim_head = conf.transpressor_dim_head
+transpressor_mlp_dim = conf.transpressor_mlp_dim
+transpressor_dropout = conf.transpressor_dropout
+transpressor_output_proj = conf.transpressor_output_proj
+
+device = conf.device
 
 if log_to_wandb:
     # Initialize wandb
@@ -139,7 +144,7 @@ def train():
         mlp_dim=transpressor_mlp_dim, 
         sequence_dim=context_length,
         output_proj=transpressor_output_proj
-    ).to("mps" if torch.backends.mps.is_available() else "cpu")
+    ).to(device)
     
     optimizer = AdamW(model.parameters(), lr=lr)
 
@@ -148,8 +153,8 @@ def train():
         # --- Training ---
         train_loss = 0.0
         for batch in tqdm(train_loader, desc="Training"):
-            input = batch["input"].flatten(0, 1).to("mps" if torch.backends.mps.is_available() else "cpu")
-            target = batch["target"].flatten(0, 1).to("mps" if torch.backends.mps.is_available() else "cpu")
+            input = batch["input"].flatten(0, 1).to(device)
+            target = batch["target"].flatten(0, 1).to(device)
 
             optimizer.zero_grad()
             preds = compressor_forward(model, input, target, stage="train")
@@ -163,8 +168,8 @@ def train():
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
-                input = batch["input"].flatten(0, 1).to("mps" if torch.backends.mps.is_available() else "cpu")
-                target = batch["target"].flatten(0, 1).to("mps" if torch.backends.mps.is_available() else "cpu")
+                input = batch["input"].flatten(0, 1).to(device)
+                target = batch["target"].flatten(0, 1).to(device)
                 preds = compressor_forward(model, input, target, stage="val")
                 val_loss += preds["loss"].item()
 
