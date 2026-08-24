@@ -157,7 +157,7 @@ class TransformerEncoder(nn.Module):
         )
         
         self.pos_enc = (
-            nn.Embedding(sequence_dim, hidden_dim)
+            nn.Embedding(2 * sequence_dim, hidden_dim)
         )
 
         for _ in range(depth):
@@ -224,7 +224,7 @@ class TransformerDecoder(nn.Module):
         )
         
         self.pos_enc = (
-            nn.Embedding(sequence_dim, hidden_dim)
+            nn.Embedding(2 * sequence_dim, hidden_dim)
         )
         
         self.output_proj = (
@@ -247,7 +247,7 @@ class TransformerDecoder(nn.Module):
         c: (batch, 1, embed_dim)
         """
         _, seq_len, _ = x.shape
-        
+
         c = self.mlp(c)
         c = self.input_norm(c)
         
