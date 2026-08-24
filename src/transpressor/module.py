@@ -110,7 +110,7 @@ class ConditionalBlock(nn.Module):
 
     def forward(self, x, c):
         c = self.conditional_proj(c)
-        
+
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )

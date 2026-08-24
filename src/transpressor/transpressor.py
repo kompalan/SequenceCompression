@@ -84,7 +84,13 @@ def compressor_forward(model, input, target, stage="train"):
 
     return output
 
+def nan_hook(module, inp, out):
+    if isinstance(out, torch.Tensor) and not torch.isfinite(out).all():
+        raise RuntimeError(f"NaN in {module}")
+    
+# -- Setup -- 
 conf = OmegaConf.load("config/transpressor.yaml")
+torch.autograd.set_detect_anomaly(True)
 
 n_epochs = conf.n_epochs
 lr = conf.lr
@@ -131,6 +137,7 @@ if log_to_wandb:
         },
     )
 
+# -- Training loop -- 
 def train():
     train_loader, val_loader = action_dataloader("data/pusht_expert_train.h5", context_length=context_length, batch_size=batch_size)
     
@@ -145,7 +152,10 @@ def train():
         sequence_dim=context_length,
         output_proj=transpressor_output_proj
     ).to(device)
-    
+
+    for m in model.modules():
+        m.register_forward_hook(nan_hook)
+
     optimizer = AdamW(model.parameters(), lr=lr)
 
 
@@ -182,6 +192,9 @@ def train():
             })
         else:
             print(f"Epoch {epoch}: Train Loss: {train_loss / len(train_loader)}, Val Loss: {val_loss / len(val_loader)}")
+
+        # Save the model checkpoint
+        torch.save(model.state_dict(), f"checkpoints/transpressor_epoch_{epoch}.pt")
         
 if __name__ == "__main__":
     train()
