@@ -1,16 +1,20 @@
+import os
 import torch
 import torch.nn.functional as F
 import h5py
+import wandb
+from tqdm import tqdm
+from omegaconf import OmegaConf
 
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+import torch.distributed as dist
 
 from .module import Transpressor
-
-import wandb
-from tqdm import tqdm
-from omegaconf import OmegaConf
 
 class ActionDataset(Dataset):
     def __init__(self, h5_file, context_length):
@@ -137,10 +141,24 @@ if log_to_wandb:
         },
     )
 
+def setup_distributed():
+    """
+    Setup distributed training environment.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", 2))
+    rank = int(os.environ.get("RANK", 0))
+
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    # Both process point to the same GPU
+    torch.cuda.set_device(0)
+
+
 # -- Training loop -- 
 def train():
+    setup_distributed()
     train_loader, val_loader = action_dataloader("data/pusht_expert_train.h5", context_length=context_length, batch_size=batch_size)
-    
+
     model = Transpressor(
         input_dim=transpressor_input_dim, 
         hidden_dim=transpressor_hidden_dim, 
@@ -153,13 +171,22 @@ def train():
         output_proj=transpressor_output_proj
     ).to(device)
 
+    model = DDP(model, device_ids=[0], output_device=0)
+
+    sampler = DistributedSampler(
+        train_loader.dataset, 
+        num_replicas=dist.get_world_size(), 
+        rank=dist.get_rank(), shuffle=True
+    )
+    
     for m in model.modules():
         m.register_forward_hook(nan_hook)
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
-
     for epoch in range(n_epochs):
+        sampler.set_epoch(epoch)  # Shuffle the dataset differently at each epoch
+
         # --- Training ---
         train_loss = 0.0
         for batch in tqdm(train_loader, desc="Training"):
@@ -195,6 +222,9 @@ def train():
 
         # Save the model checkpoint
         torch.save(model.state_dict(), f"checkpoints/transpressor_epoch_{epoch}.pt")
-        
+
+    # Clean up processes
+    dist.destroy_process_group()
+
 if __name__ == "__main__":
     train()
