@@ -21,3 +21,4 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 
 ## Architecture
 
+<img width="1920" height="1080" alt="tikz-export-3" src="https://github.com/user-attachments/assets/c4753f09-9555-4605-a56d-6e511994c569" />
