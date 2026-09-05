@@ -295,3 +295,8 @@ class Transpressor(nn.Module):
     
     def decode(self, x, c=None):
         return self.decoder(x, c)
+
+    def forward(self, x):
+        encoded = self.encode(x)
+        decoded = self.decode(x, encoded)
+        return decoded, encoded

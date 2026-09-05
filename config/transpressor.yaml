@@ -1,8 +1,8 @@
 n_epochs: 100
 lr: 1e-5
-batch_size: 10
+batch_size: 500
 context_length: 4
-log_to_wandb: False
+log_to_wandb: True
 
 transpressor_input_dim: 2
 transpressor_hidden_dim: 64
@@ -14,4 +14,4 @@ transpressor_mlp_dim: 128
 transpressor_dropout: 0.1
 transpressor_output_proj: True
 
-device: "mps"
+device: "cpu"

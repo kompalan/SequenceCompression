@@ -1,4 +1,4 @@
-from .transpressor import train
-
 def main() -> None:
+    from .transpressor import train
+
     train()

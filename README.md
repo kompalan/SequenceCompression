@@ -22,3 +22,14 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 ## Architecture
 
 <img width="1920" height="1080" alt="tikz-export-3" src="https://github.com/user-attachments/assets/c4753f09-9555-4605-a56d-6e511994c569" />
+
+## Training
+
+Run the training module from the repository root to use the configured device. With
+`device: "mps"`, use a single process on Apple Silicon:
+
+```bash
+uv run python -m transpressor.transpressor
+```
+
+The distributed `torchrun` path is CPU-only. W&B logging and checkpoint writes are performed by rank 0 when distributed training is enabled.
