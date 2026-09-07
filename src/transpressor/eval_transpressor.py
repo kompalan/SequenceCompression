@@ -28,7 +28,7 @@ def build_model(config, checkpoint, device):
     model = Transpressor(
         input_dim=config.transpressor_input_dim,
         hidden_dim=config.transpressor_hidden_dim,
-        output_dim=config.transpressor_output_dim,
+        condition_dim=config.transpressor_condition_dim,
         depth=config.transpressor_depth,
         heads=config.transpressor_heads,
         dim_head=config.transpressor_dim_head,

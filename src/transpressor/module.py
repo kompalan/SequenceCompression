@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from einops import rearrange
 
+from transformers import AutoImageProcessor, AutoModel
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
@@ -52,7 +53,32 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class MLP(nn.Module):
+    """Simple MLP with optional normalization and activation"""
 
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        norm_fn=nn.LayerNorm,
+        act_fn=nn.GELU,
+    ):
+        super().__init__()
+        norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            norm_fn,
+            act_fn(),
+            nn.Linear(hidden_dim, output_dim or input_dim),
+        )
+
+    def forward(self, x):
+        """
+        x: (B*T, D)
+        """
+        return self.net(x)
+    
 class Attention(nn.Module):
     """Scaled dot-product attention with causal masking"""
 
@@ -105,8 +131,8 @@ class ConditionalBlock(nn.Module):
             else nn.Identity()
         )
 
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0) # type: ignore
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0) # type: ignore
 
     def forward(self, x, c):
         c = self.conditional_proj(c)
@@ -140,6 +166,7 @@ class TransformerEncoder(nn.Module):
         self,
         input_dim,
         hidden_dim,
+        condition_dim,
         depth,
         heads,
         dim_head,
@@ -167,15 +194,15 @@ class TransformerEncoder(nn.Module):
             
 
         self.output_proj = (
-            nn.Linear(hidden_dim, input_dim)
+            nn.Linear(hidden_dim, condition_dim)
             if out_proj
             else nn.Identity()
         )
 
         if out_proj:
-            self.mlp = FeedForward(input_dim, mlp_dim, dropout=dropout)
+            self.mlp = MLP(condition_dim, mlp_dim)
         else:
-            self.mlp = FeedForward(hidden_dim, mlp_dim, dropout=dropout)
+            self.mlp = MLP(hidden_dim, mlp_dim)
 
     def forward(self, x):
         """
@@ -200,7 +227,7 @@ class TransformerDecoder(nn.Module):
         self,
         input_dim,
         hidden_dim,
-        output_dim,
+        condition_dim,
         depth,
         heads,
         dim_head,
@@ -212,12 +239,14 @@ class TransformerDecoder(nn.Module):
         super().__init__()
 
         if out_proj:
-            self.input_norm = nn.LayerNorm(input_dim)
+            self.input_norm = nn.LayerNorm(condition_dim)
         else:
             self.input_norm = nn.LayerNorm(hidden_dim)
 
         self.norm = nn.LayerNorm(hidden_dim)
         self.layers = nn.ModuleList([])
+
+        self.input_dropout = nn.Dropout(0.50)
 
         self.input_proj = (
             nn.Linear(input_dim, hidden_dim)
@@ -228,18 +257,18 @@ class TransformerDecoder(nn.Module):
         )
         
         self.output_proj = (
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, input_dim)
         )
 
         for _ in range(depth):
             self.layers.append(
-                ConditionalBlock(hidden_dim, input_dim, heads, dim_head, mlp_dim, dropout=dropout)
+                ConditionalBlock(hidden_dim, condition_dim, heads, dim_head, mlp_dim, dropout=dropout)
             )
 
         if out_proj:
-            self.mlp = FeedForward(input_dim, mlp_dim, dropout=dropout)
+            self.mlp = MLP(condition_dim, mlp_dim)
         else:
-            self.mlp = FeedForward(hidden_dim, mlp_dim, dropout=dropout)
+            self.mlp = MLP(hidden_dim, mlp_dim)
 
     def forward(self, x, c=None):
         """
@@ -252,6 +281,8 @@ class TransformerDecoder(nn.Module):
         c = self.input_norm(c)
         
         x = self.input_proj(x)
+        x = self.input_dropout(x)
+
         x = x + self.pos_enc(torch.arange(seq_len, device=x.device))
         
         for block in self.layers:
@@ -263,12 +294,30 @@ class TransformerDecoder(nn.Module):
             
         return x
 
+class ARPredictor(nn.Module):
+    def __init__(
+            self, 
+            input_dim, 
+            hidden_dim, 
+            condition_dim, 
+            depth, 
+            heads, 
+            dim_head, 
+            mlp_dim, 
+            dropout=0.1
+    ):
+        super().__init__()
+        self.transformer = TransformerDecoder(input_dim, hidden_dim, condition_dim, depth, heads, dim_head, mlp_dim, dropout=dropout)
+
+    def forward(self, x, c=None):
+        return self.transformer(x, c)
+
 class Transpressor(nn.Module):
     def __init__(
         self,
         input_dim,
         hidden_dim,
-        output_dim,
+        condition_dim,
         depth,
         heads,
         dim_head,
@@ -279,13 +328,13 @@ class Transpressor(nn.Module):
     ):
         super().__init__()
         self.encoder = TransformerEncoder(
-            input_dim, hidden_dim, depth, heads, 
+            input_dim, hidden_dim, condition_dim, depth, heads, 
             dim_head, mlp_dim, dropout=dropout, 
             sequence_dim=sequence_dim, out_proj=output_proj
         )
 
         self.decoder = TransformerDecoder(
-            input_dim, hidden_dim, output_dim, 
+            input_dim, hidden_dim, condition_dim, 
             depth, heads, dim_head, mlp_dim, 
             sequence_dim=sequence_dim, out_proj=output_proj
         )
@@ -300,3 +349,42 @@ class Transpressor(nn.Module):
         encoded = self.encode(x)
         decoded = self.decode(x, encoded)
         return decoded, encoded
+
+class JEPA(nn.Module):
+    def __init__(
+            self,
+            preprocessor,
+            pixel_encoder, 
+            action_encoder, 
+            predictor
+    ):
+        super().__init__()
+
+        self.preprocessor = preprocessor
+        self.pixel_encoder = pixel_encoder
+        self.pixel_projector = MLP(self.preprocessor.config.hidden_size, self.preprocessor.config.hidden_size*2)
+
+        self.action_encoder = action_encoder
+        self.predictor = predictor
+
+    def encode_pixels(self, pixels):
+        processed_pixels = self.preprocessor(pixels, return_tensors="pt")
+        encoded_pixels = self.pixel_encoder(**processed_pixels)
+        encoded_pixels = self.pixel_projector(encoded_pixels)
+        
+        return encoded_pixels
+
+    def encode_actions(self, actions):
+        return self.action_encoder.encode(actions)
+
+    def decode_actions(self, actions, conditions):
+        return self.action_encoder.decode(actions, conditions)
+
+    def predict(self, pixels, actions):
+        encoded_pixels = self.encode_pixels(pixels)
+        encoded_actions = self.encode_actions(actions)
+        next_observation = self.predictor(encoded_pixels, encoded_actions)
+        decoded_actions = self.decode_actions(actions, encoded_actions)
+
+        return next_observation, encoded_actions, decoded_actions
+    

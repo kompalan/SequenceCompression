@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.nn.functional as F
+import hdf5plugin
 import h5py
 import torch.distributed as dist
 
@@ -10,11 +11,13 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, random_spl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
-from .module import Transpressor, SIGReg
+from .module import JEPA, ARPredictor, Transpressor, SIGReg
 
 import wandb
 from tqdm import tqdm
 from omegaconf import OmegaConf
+
+from transformers import AutoImageProcessor, AutoModel
 
 class ActionDataset(Dataset):
     def __init__(self, h5_file, context_length):
@@ -23,14 +26,14 @@ class ActionDataset(Dataset):
         self._h5 = h5py.File(self.h5_file, "r")
 
         with h5py.File(h5_file, "r") as f:
-            self.length = len(self._h5["action"]) - self.context_length
+            self.length = len(self._h5["action"]) - self.context_length # type: ignore
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
         i = idx
-        actions = torch.tensor(self._h5["action"][i:i + self.context_length], dtype=torch.float32)
+        actions = torch.tensor(self._h5["action"][i:i + self.context_length], dtype=torch.float32) # type: ignore
         actions = actions.unsqueeze(0).expand(self.context_length, self.context_length, -1)  # Expand to (context_length, context_length, action_dim)
 
         # Create an upper triangular mask with 1's on the off diagonal and 0's on the diagonal and below
@@ -43,7 +46,16 @@ class ActionDataset(Dataset):
 
         input = input_seq_with_delimiters[:, :-1, :]
         target = input_seq_with_delimiters[:, 1:, :]
-        return {"input": input, "target": target}
+
+        # Row r has r + 1 actions unmasked, so its observations are the
+        # initial state (index i) and the state after r + 1 actions
+        # (index i + r + 1).
+        start_pixels = torch.tensor(self._h5["pixels"][i], dtype=torch.float32)  # type: ignore
+        end_pixels = torch.tensor(self._h5["pixels"][i + 1:i + self.context_length + 1], dtype=torch.float32)  # type: ignore
+        start_pixels = start_pixels.unsqueeze(0).expand(self.context_length, *start_pixels.shape)
+        pixels = torch.stack([start_pixels, end_pixels], dim=1)  # Shape: (context_length, 2, H, W, C)
+
+        return {"input": input, "target": target, "pixels": pixels}
 
 def action_dataloader(h5_file, context_length, batch_size, distributed=False):
     dataset = ActionDataset(h5_file, context_length)
@@ -85,16 +97,8 @@ lr = conf.lr
 batch_size = conf.batch_size
 context_length = conf.context_length
 log_to_wandb = conf.log_to_wandb
+datapath = conf.datapath
 
-transpressor_input_dim = conf.transpressor_input_dim
-transpressor_hidden_dim = conf.transpressor_hidden_dim
-transpressor_output_dim = conf.transpressor_output_dim
-transpressor_depth = conf.transpressor_depth
-transpressor_heads = conf.transpressor_heads
-transpressor_dim_head = conf.transpressor_dim_head
-transpressor_mlp_dim = conf.transpressor_mlp_dim
-transpressor_dropout = conf.transpressor_dropout
-transpressor_output_proj = conf.transpressor_output_proj
 device = conf.device
 sigreg_term: SIGReg | None = None
 
@@ -127,7 +131,7 @@ def reduce_loss(total_loss, batch_count, training_device):
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1]).item()
 
-def compressor_forward(model, input, target, stage="train"):
+def compressor_forward(model, input, pixels, target, stage="train"):
     """Encode a sequence into a summary vector and train a decoder to reconstruct it."""
 
     if sigreg_term is None:
@@ -140,22 +144,23 @@ def compressor_forward(model, input, target, stage="train"):
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
-    decoded, encoded = model(input)
+    next_observation, encoded_actions, decoded_actions = model(pixels, input)
 
+    mse_loss = F.mse_loss(decoded_actions, target)
+    action_sigreg_loss = sigreg_term(encoded_actions)
 
-    mse_loss = F.mse_loss(decoded, target)
-    sigreg_loss = sigreg_term(encoded)
     # Predict the next action token from the summary plus the preceding context.
     # Take the first seq_len-1 tokens and compare it to a shifted version of actions[1:]
-    loss = mse_loss + sigreg_loss
+    loss = mse_loss + action_sigreg_loss
 
     output = {
         "actions": input,
-        "compressed": encoded,
-        "decompressed": decoded,
+        "compressed": encoded_actions,
+        "decompressed": decoded_actions,
+        "next_observation": next_observation,
         "loss": loss,
         "mse_loss": mse_loss,
-        "sigreg_loss": sigreg_loss
+        "sigreg_loss": action_sigreg_loss
     }
 
     return output
@@ -175,19 +180,30 @@ if log_to_wandb and int(os.environ.get("RANK", "0")) == 0:
         config={
             "learning_rate": lr,
             "architecture": "Transformer",
-            "dataset": "kompallia/pusht_expert_train.h5",
+            "dataset": conf.datapath,
             "epochs": n_epochs,
             "context_length": context_length,
             "batch_size": batch_size,
-            "transpressor_input_dim": transpressor_input_dim,
-            "transpressor_hidden_dim": transpressor_hidden_dim,
-            "transpressor_output_dim": transpressor_output_dim,
-            "transpressor_depth": transpressor_depth,
-            "transpressor_heads": transpressor_heads,
-            "transpressor_dim_head": transpressor_dim_head,
-            "transpressor_mlp_dim": transpressor_mlp_dim,
-            "transpressor_dropout": transpressor_dropout,
-            "transpressor_output_proj": transpressor_output_proj
+            "transpressor_input_dim": conf.transpressor.input_dim,
+            "transpressor_hidden_dim": conf.transpressor.hidden_dim,
+            "transpressor_condition_dim": conf.transpressor.condition_dim,
+            "transpressor_depth": conf.transpressor.depth,
+            "transpressor_heads": conf.transpressor.heads,
+            "transpressor_dim_head": conf.transpressor.dim_head,
+            "transpressor_mlp_dim": conf.transpressor.mlp_dim,
+            "transpressor_dropout": conf.transpressor.dropout,
+            "transpressor_output_proj": conf.transpressor.output_proj,
+            "ar_predictor_input_dim": conf.ar_predictor.input_dim,
+            "ar_predictor_hidden_dim": conf.ar_predictor.hidden_dim,
+            "ar_predictor_condition_dim": conf.ar_predictor.condition_dim,
+            "ar_predictor_depth": conf.ar_predictor.depth,
+            "ar_predictor_heads": conf.ar_predictor.heads,
+            "ar_predictor_dim_head": conf.ar_predictor.dim_head,
+            "ar_predictor_mlp_dim": conf.ar_predictor.mlp_dim,
+            "ar_predictor_dropout": conf.ar_predictor.dropout,
+            "pixel_preprocessor_model_name": conf.pixel_preprocessor.model_name,
+            "pixel_encoder_model_name": conf.pixel_encoder.model_name,
+
         },
     )
 
@@ -199,23 +215,45 @@ def train():
     if is_main_process:
         print(f"Training on {training_device}")
     train_loader, val_loader, train_sampler = action_dataloader(
-        "data/pusht_expert_train.h5",
+        conf.datapath,
         context_length=context_length,
         batch_size=batch_size,
         distributed=distributed,
     )
-    
-    model = Transpressor(
-        input_dim=transpressor_input_dim, 
-        hidden_dim=transpressor_hidden_dim, 
-        output_dim=transpressor_output_dim, 
-        depth=transpressor_depth, 
-        heads=transpressor_heads,
-        dim_head=transpressor_dim_head, 
-        mlp_dim=transpressor_mlp_dim, 
+
+    # -- Model definition -- 
+    action_encoder = Transpressor(
+        input_dim=conf.transpressor.input_dim, 
+        hidden_dim=conf.transpressor.hidden_dim, 
+        condition_dim=conf.transpressor.condition_dim, 
+        depth=conf.transpressor.depth, 
+        heads=conf.transpressor.heads,
+        dim_head=conf.transpressor.dim_head, 
+        mlp_dim=conf.transpressor.mlp_dim, 
         sequence_dim=context_length,
-        output_proj=transpressor_output_proj
+        output_proj=conf.transpressor.output_proj
     ).to(training_device)
+
+    predictor = ARPredictor(
+        input_dim=conf.ar_predictor.input_dim,
+        hidden_dim=conf.ar_predictor.hidden_dim,
+        condition_dim=conf.ar_predictor.condition_dim,
+        depth=conf.ar_predictor.depth,
+        heads=conf.ar_predictor.heads,
+        dim_head=conf.ar_predictor.dim_head,
+        mlp_dim=conf.ar_predictor.mlp_dim,
+        dropout=conf.ar_predictor.dropout
+    ).to(training_device)
+
+    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
+    pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
+
+    model = JEPA(
+        preprocessor=pixel_preprocessor,
+        pixel_encoder=pixel_encoder,
+        action_encoder=action_encoder,
+        predictor=predictor
+    )
 
     if distributed:
         model = DistributedDataParallel(model)
@@ -227,7 +265,7 @@ def train():
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
-
+    global_step = 0
     for epoch in range(n_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -238,14 +276,23 @@ def train():
         for batch in train_iterator:
             input = batch["input"].flatten(0, 1).to(training_device)
             target = batch["target"].flatten(0, 1).to(training_device)
+            pixels = batch["pixels"].flatten(0, 1).to(training_device)
 
             optimizer.zero_grad()
-            preds = compressor_forward(model, input, target, stage="train")
+            preds = compressor_forward(model, input, pixels, target, stage="train")
             loss = preds["loss"]
 
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+
+            if is_main_process and log_to_wandb:
+                run.log({
+                    "train/loss": loss.item(),
+                    "train/mse_loss": preds["mse_loss"].item(),
+                    "train/sigreg_loss": preds["sigreg_loss"].item(),
+                }, step=global_step)
+            global_step += 1
 
         # --- Validation ---
         val_loss = 0.0
@@ -254,7 +301,9 @@ def train():
             for batch in val_iterator:
                 input = batch["input"].flatten(0, 1).to(training_device)
                 target = batch["target"].flatten(0, 1).to(training_device)
-                preds = compressor_forward(model, input, target, stage="val")
+                pixels = batch["pixels"].flatten(0, 1).to(training_device)
+                
+                preds = compressor_forward(model, input, pixels, target, stage="val")
                 val_loss += preds["loss"].item()
 
         train_loss = reduce_loss(train_loss, len(train_loader), training_device)
