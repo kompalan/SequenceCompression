@@ -44,8 +44,12 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 
 ## Architecture
 
-<img width="1920" height="1080" alt="tikz-export" src="https://github.com/user-attachments/assets/c6199a68-1eb9-439a-a026-06c888f06b38" />
+<img width="666" height="269" alt="tikz-export" src="https://github.com/user-attachments/assets/c6199a68-1eb9-439a-a026-06c888f06b38" />
 
+<img width="666" height="269" alt="Screenshot 2026-09-07 at 2 13 42 PM" src="https://github.com/user-attachments/assets/cfd71aec-6607-4670-a19e-b1182891f1a3" />
+
+
+*Note: not my figure. Credit to Lucas Maes et. al
 ## Training
 
 Run the training module from the repository root to use the configured device. With
