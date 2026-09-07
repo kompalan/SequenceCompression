@@ -12,8 +12,7 @@ In the case of sufficiently covering the state space of the environment, the mod
 What if we could make informative data from existing interaction data? For example, say you have a set of interaction data over 1k episodes, each lasting M timesteps. What if you not only gave those interactions to the model, but also took a subset of the data, compressed it, and fed that as well. In essence, teach the model to recognize not only how each individual action transforms the observation space, but also how a set of actions chain into a transformation? This would not only take a dataset and enlarge it by a factor of `2^M` (you could build the superset of each M-timestep episode), but also give the model a language to plan hierarchically. It would be able to output latent actions that span an arbitrary number of timesteps, and better understand how actions affect observations due to the explosion of training data.
 
 Here's a little video I made with Claude to better explain what I'm trying to test:
-<p align="center"><video src="https://github.com/user-attachments/assets/9cef7c32-f904-422c-9067-ed9a576f1b52">
-</video></c>
+<p align="center"><video src="https://github.com/user-attachments/assets/7b6d8ab6-ae74-472e-9cbd-94f7e21e5192""></video></p>
 
 ## Related Work
 
