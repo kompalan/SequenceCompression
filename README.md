@@ -5,11 +5,35 @@
 
 ## Brief Explanation
 
-The recent LeWorldModel paper introduced a new way to train JEPA-based dynamics models without the need for heuristics such as stop-gradients and EMA's. However, two of the claimed [limitations](https://arxiv.org/html/2603.19312v3#S6) of the LeWorldModel paper is that the planning horizon remains small, and that data must sufficiently cover the state space of the task. But what if these problems stemmed from the same lack of good interaction data? If the planning horizon remains small, then this means that each predicted latent is a subtly degraded version of the ground truth. And as degraded predictions are fed back in, further predictions stray further from the ground truth. This means that the model hasn't fully internalized how dynamics work. Even in relatively simple scenarios such as PushT, performance degrades sharply as goal latent is pushed further back.
+The recent [*LeWorldModel*](https://arxiv.org/abs/2603.19312) paper trains JEPA-based dynamics models without 
+heuristics like stop-gradients or EMA targets, but it flags two important 
+[limitations](https://arxiv.org/html/2603.19312v3#S6): **planning horizons stay 
+short**, and training data must **densely cover the task's state space**. This repository aims to investigate whether both may 
+share one root cause: a lack of "good" interaction data.
 
-In the case of sufficiently covering the state space of the environment, the model needs more than a sufficient set of data: it needs lots of redundancy, with the same underlying information represented a number of different ways for the model to internalize the environment's dynamics.
+### **Short horizons.** 
+Each predicted latent is a slightly degraded copy of the 
+ground truth. Feed that back in as input, and errors compound. As later 
+predictions drift further from reality, the model never fully internalizes 
+the dynamics of its environment. Even in simple settings like PushT, performance collapses as the 
+goal is pushed further into the future.
 
-What if we could make informative data from existing interaction data? For example, say you have a set of interaction data over 1k episodes, each lasting M timesteps. What if you not only gave those interactions to the model, but also took a subset of the data, compressed it, and fed that as well. In essence, teach the model to recognize not only how each individual action transforms the observation space, but also how a set of actions chain into a transformation? This would not only take a dataset and enlarge it by a factor of `2^M` (you could build the superset of each M-timestep episode), but also give the model a language to plan hierarchically. It would be able to output latent actions that span an arbitrary number of timesteps, and better understand how actions affect observations due to the explosion of training data.
+### **Poor coverage (or, what makes interaction data "good"?)** 
+The fix isn't just *more* data, but *redundant* data — the 
+same information expressed in multiple ways, so the model generalizes the 
+dynamics instead of memorizing trajectories.
+
+**The idea:** 
+Synthesize new training examples from existing interaction data. 
+Given 1k episodes of length $M$, don't just train on individual transitions — 
+also compress subsequences of each episode and train on those as *compound* 
+transitions. This teaches the model not only how one action changes an 
+observation, but how a *chain* of actions composes into a single transformation.
+
+This gives two payoffs:
+- **More data:** each $M$-step episode expands into its $2^M$ possible subsequences.
+- **Hierarchical planning:** the model learns latent "actions" spanning arbitrary 
+  numbers of timesteps — a vocabulary for long-horizon planning.
 
 Here's a little video I made with Claude to better explain what I'm trying to test:
 <p align="center"><video src="https://github.com/user-attachments/assets/7b6d8ab6-ae74-472e-9cbd-94f7e21e5192""></video></p>
