@@ -20,7 +20,7 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 
 ## Architecture
 
-<img width="1920" height="1080" alt="tikz-export-3" src="https://github.com/user-attachments/assets/c4753f09-9555-4605-a56d-6e511994c569" />
+<img width="1920" height="1080" alt="tikz-export" src="https://github.com/user-attachments/assets/c6199a68-1eb9-439a-a026-06c888f06b38" />
 
 ## Training
 
@@ -32,3 +32,8 @@ uv run python -m transpressor.transpressor
 ```
 
 The distributed `torchrun` path is CPU-only. W&B logging and checkpoint writes are performed by rank 0 when distributed training is enabled.
+
+
+## Results
+
+<img width="1920" height="1080" alt="sequence_compression_loss_chart" src="https://github.com/user-attachments/assets/7515a0aa-00c3-4910-90eb-ea6459e22599" />
