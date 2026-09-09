@@ -19,6 +19,9 @@ from omegaconf import OmegaConf
 
 from transformers import AutoImageProcessor, AutoModel
 
+START_VALUE = -2.0
+END_VALUE = -3.0
+
 class ActionDataset(Dataset):
     def __init__(self, h5_file, context_length):
         self.h5_file = h5_file
@@ -42,8 +45,8 @@ class ActionDataset(Dataset):
         actions = torch.tensor(self._h5["action"][i:i + self.context_length], dtype=torch.float32) # type: ignore
         actions = actions.unsqueeze(0).expand(self.context_length, self.context_length, -1)  # Expand to (context_length, context_length, action_dim)
 
-        start_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), -2.0)
-        end_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), -3.0)
+        start_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), START_VALUE)
+        end_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), END_VALUE)
         input_seq_with_delimiters = torch.cat([start_padding, actions, end_padding], dim=1)
 
         input = input_seq_with_delimiters[:, :-1, :]
@@ -93,18 +96,22 @@ def action_dataloader(h5_file, context_length, batch_size, distributed=False):
 def build_prefix_masks(context_length):
     """Structural (data-independent) validity info for the all-prefixes-per-window trick.
 
-    Row r of a window represents the first r+1 actions as real. encoder_lengths[r] is the
-    true length of the (START + actions) input sequence for row r. target_valid[r] marks
-    which target positions are real predictions for row r (the END delimiter is only a
-    meaningful target on the row that is genuinely the full window).
+    Row r of a window treats the first r+1 actions as a complete, self-terminating
+    sequence: START, a_0..a_r, END. encoder_lengths[r] is the true length of the
+    (START + actions) input sequence for row r. target_valid[r] marks which target
+    positions are real predictions for row r: the r+1 real actions, plus the position
+    immediately after them, which should predict END. END only lives at a fixed physical
+    column (the last one) shared by every row, so for every row but the last, that
+    "predict END" position doesn't hold END in the raw data - it holds the window's next
+    real action instead. end_override marks exactly those positions, so the caller can
+    substitute the END value before computing the loss.
     """
     encoder_lengths = torch.arange(context_length) + 2
-    target_valid = torch.zeros(context_length, context_length + 1, dtype=torch.bool)
     r = torch.arange(context_length)
-    k = torch.arange(context_length)
-    target_valid[:, :context_length] = (k.unsqueeze(0) <= r.unsqueeze(1))
-    target_valid[context_length - 1, context_length] = True
-    return encoder_lengths, target_valid
+    k = torch.arange(context_length + 1)
+    target_valid = (k.unsqueeze(0) <= r.unsqueeze(1)) | (k.unsqueeze(0) == (r + 1).unsqueeze(1))
+    end_override = (k.unsqueeze(0) == (r + 1).unsqueeze(1)) & (k.unsqueeze(0) < context_length)
+    return encoder_lengths, target_valid, end_override
 
 # -- Setup --
 conf = OmegaConf.load("config/transpressor.yaml")
@@ -149,7 +156,7 @@ def reduce_loss(total_loss, batch_count, training_device):
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1]).item()
 
-def compressor_forward(model, input, pixels, target, lengths, target_valid, stage="train"):
+def compressor_forward(model, input, pixels, target, lengths, target_valid, end_override, stage="train"):
     """Encode a sequence into a summary vector and train a decoder to reconstruct it."""
 
     if sigreg_term is None:
@@ -163,6 +170,11 @@ def compressor_forward(model, input, pixels, target, lengths, target_valid, stag
         raise ValueError(f"Unknown stage: {stage}")
 
     next_observation, encoded_actions, decoded_actions = model(pixels, input, lengths)
+
+    # Every prefix row is trained as its own complete, self-terminating sequence, so the
+    # position right after a row's last real action must be compared against END - even
+    # though the raw window data holds the window's next real action there instead.
+    target = target.masked_fill(end_override.unsqueeze(-1).expand_as(target), END_VALUE)
 
     valid = target_valid.unsqueeze(-1).expand_as(target)
     mse_loss = (decoded_actions - target).square().masked_select(valid).mean()
@@ -297,9 +309,10 @@ def train():
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
-    encoder_lengths, target_valid = build_prefix_masks(context_length)
+    encoder_lengths, target_valid, end_override = build_prefix_masks(context_length)
     encoder_lengths = encoder_lengths.to(training_device)
     target_valid = target_valid.to(training_device)
+    end_override = end_override.to(training_device)
 
     global_step = 0
     for epoch in range(n_epochs):
@@ -316,9 +329,10 @@ def train():
             pixels = batch["pixels"].flatten(0, 1).to(training_device)
             batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
             batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
+            batch_end_override = end_override.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
 
             optimizer.zero_grad()
-            preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, stage="train")
+            preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, batch_end_override, stage="train")
             loss = preds["loss"]
 
             loss.backward()
@@ -344,8 +358,9 @@ def train():
                 pixels = batch["pixels"].flatten(0, 1).to(training_device)
                 batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
                 batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
+                batch_end_override = end_override.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
 
-                preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, stage="val")
+                preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, batch_end_override, stage="val")
                 val_loss += preds["loss"].item()
 
         train_loss = reduce_loss(train_loss, len(train_loader), training_device)
