@@ -321,18 +321,23 @@ class TransformerDecoder(nn.Module):
 
 class ARPredictor(nn.Module):
     def __init__(
-            self, 
-            input_dim, 
-            hidden_dim, 
-            condition_dim, 
-            depth, 
-            heads, 
-            dim_head, 
-            mlp_dim, 
-            dropout=0.1
+            self,
+            input_dim,
+            hidden_dim,
+            condition_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout=0.1,
+            sequence_dim=7,
+            out_proj=False,
     ):
         super().__init__()
-        self.transformer = TransformerDecoder(input_dim, hidden_dim, condition_dim, depth, heads, dim_head, mlp_dim, dropout=dropout)
+        self.transformer = TransformerDecoder(
+            input_dim, hidden_dim, condition_dim, depth, heads, dim_head, mlp_dim,
+            dropout=dropout, sequence_dim=sequence_dim, out_proj=out_proj
+        )
 
     def forward(self, x, c=None):
         return self.transformer(x, c)
@@ -387,16 +392,16 @@ class JEPA(nn.Module):
 
         self.preprocessor = preprocessor
         self.pixel_encoder = pixel_encoder
-        self.pixel_projector = MLP(self.preprocessor.config.hidden_size, self.preprocessor.config.hidden_size*2)
+        self.pixel_projector = MLP(self.pixel_encoder.config.hidden_size, self.pixel_encoder.config.hidden_size*2)
 
         self.action_encoder = action_encoder
         self.predictor = predictor
 
     def encode_pixels(self, pixels):
         processed_pixels = self.preprocessor(pixels, return_tensors="pt")
-        encoded_pixels = self.pixel_encoder(**processed_pixels)
+        encoded_pixels = self.pixel_encoder(**processed_pixels).last_hidden_state
         encoded_pixels = self.pixel_projector(encoded_pixels)
-        
+
         return encoded_pixels
 
     def encode_actions(self, actions, lengths=None):

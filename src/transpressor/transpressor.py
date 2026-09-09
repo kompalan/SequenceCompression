@@ -253,19 +253,32 @@ def train():
         output_proj=conf.transpressor.output_proj
     ).to(training_device)
 
+    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
+    pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
+
+    # ARPredictor attends over the pixel encoder's own patch-token sequence (CLS + patches,
+    # standard ViT/DINOv2 layout), so its positional-embedding table must be sized to match
+    # that model's real token count rather than an arbitrary default.
+    pixel_sequence_dim = (pixel_encoder.config.image_size // pixel_encoder.config.patch_size) ** 2 + 1
+
     predictor = ARPredictor(
-        input_dim=conf.ar_predictor.input_dim,
+        # x for ARPredictor's decoder is the pixel encoder's own token embeddings, so its
+        # feature dim must track the pixel encoder's hidden size, not conf.ar_predictor.input_dim
+        # (which is the action dim and unrelated to this path).
+        input_dim=pixel_encoder.config.hidden_size,
         hidden_dim=conf.ar_predictor.hidden_dim,
         condition_dim=conf.ar_predictor.condition_dim,
         depth=conf.ar_predictor.depth,
         heads=conf.ar_predictor.heads,
         dim_head=conf.ar_predictor.dim_head,
         mlp_dim=conf.ar_predictor.mlp_dim,
-        dropout=conf.ar_predictor.dropout
+        dropout=conf.ar_predictor.dropout,
+        sequence_dim=pixel_sequence_dim,
+        # ARPredictor is conditioned on encoded_actions, i.e. the action encoder's own
+        # output, so its conditioning-input dimensionality must track the same output_proj
+        # flag that determines that output's shape (condition_dim vs hidden_dim).
+        out_proj=conf.transpressor.output_proj,
     ).to(training_device)
-
-    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
-    pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
 
     model = JEPA(
         preprocessor=pixel_preprocessor,
