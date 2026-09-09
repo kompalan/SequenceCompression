@@ -98,17 +98,29 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x, attn_mask):
         """
         x : (B, T, D)
+        attn_mask : bool, broadcastable to (B, heads, T, T), True = attend
         """
         # x = self.norm(x)
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop)
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
+
+
+def build_causal_padding_mask(seq_len, lengths, device):
+    """Combined causal + key-padding mask.
+
+    lengths: (B,) true sequence length per sample. Returns bool (B, 1, T, T), True = attend.
+    """
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    key_valid = torch.arange(seq_len, device=device)[None, :] < lengths[:, None]
+    mask = causal[None, :, :] & key_valid[:, None, :]
+    return mask.unsqueeze(1)
 
 
 class ConditionalBlock(nn.Module):
@@ -134,13 +146,13 @@ class ConditionalBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0) # type: ignore
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0) # type: ignore
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask):
         c = self.conditional_proj(c)
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), attn_mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -156,8 +168,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attn_mask):
+        x = x + self.attn(self.norm1(x), attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -204,22 +216,29 @@ class TransformerEncoder(nn.Module):
         else:
             self.mlp = MLP(hidden_dim, mlp_dim)
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         x: (batch, seq_len, action_dim)
+        lengths: (batch,) true sequence length per sample; None = fully valid (old behavior)
         """
-        _, seq_len, _ = x.shape
+        batch, seq_len, _ = x.shape
+
+        if lengths is None:
+            lengths = torch.full((batch,), seq_len, dtype=torch.long, device=x.device)
+
+        attn_mask = build_causal_padding_mask(seq_len, lengths, x.device)
 
         x = self.input_proj(x)
         x = x + self.pos_enc(torch.arange(seq_len, device=x.device))
 
         for block in self.layers:
-            x = block(x)
+            x = block(x, attn_mask)
 
         x = self.output_proj(x)
 
-        last = x[:, -1:, :]
-        
+        idx = (lengths - 1).clamp(min=0).view(-1, 1, 1).expand(-1, 1, x.shape[-1])
+        last = torch.gather(x, 1, idx)
+
         return self.mlp(last)
     
 class TransformerDecoder(nn.Module):
@@ -270,24 +289,30 @@ class TransformerDecoder(nn.Module):
         else:
             self.mlp = MLP(hidden_dim, mlp_dim)
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, lengths=None):
         """
         x: (batch, sequence_dim, action_dim)
         c: (batch, 1, embed_dim)
+        lengths: (batch,) true sequence length per sample; None = fully valid (old behavior)
         """
-        _, seq_len, _ = x.shape
+        batch, seq_len, _ = x.shape
+
+        if lengths is None:
+            lengths = torch.full((batch,), seq_len, dtype=torch.long, device=x.device)
+
+        attn_mask = build_causal_padding_mask(seq_len, lengths, x.device)
 
         c = self.mlp(c)
         c = self.input_norm(c)
-        
+
         x = self.input_proj(x)
         x = self.input_dropout(x)
 
         x = x + self.pos_enc(torch.arange(seq_len, device=x.device))
-        
+
         for block in self.layers:
-            x = block(x, c)
-            
+            x = block(x, c, attn_mask)
+
         x = self.norm(x)
 
         x = self.output_proj(x)
@@ -339,15 +364,15 @@ class Transpressor(nn.Module):
             sequence_dim=sequence_dim, out_proj=output_proj
         )
         
-    def encode(self, x):
-        return self.encoder(x)
-    
-    def decode(self, x, c=None):
-        return self.decoder(x, c)
+    def encode(self, x, lengths=None):
+        return self.encoder(x, lengths)
 
-    def forward(self, x):
-        encoded = self.encode(x)
-        decoded = self.decode(x, encoded)
+    def decode(self, x, c=None, lengths=None):
+        return self.decoder(x, c, lengths)
+
+    def forward(self, x, lengths=None):
+        encoded = self.encode(x, lengths)
+        decoded = self.decode(x, encoded, lengths)
         return decoded, encoded
 
 class JEPA(nn.Module):
@@ -374,17 +399,20 @@ class JEPA(nn.Module):
         
         return encoded_pixels
 
-    def encode_actions(self, actions):
-        return self.action_encoder.encode(actions)
+    def encode_actions(self, actions, lengths=None):
+        return self.action_encoder.encode(actions, lengths)
 
-    def decode_actions(self, actions, conditions):
-        return self.action_encoder.decode(actions, conditions)
+    def decode_actions(self, actions, conditions, lengths=None):
+        return self.action_encoder.decode(actions, conditions, lengths)
 
-    def predict(self, pixels, actions):
+    def predict(self, pixels, actions, lengths=None):
         encoded_pixels = self.encode_pixels(pixels)
-        encoded_actions = self.encode_actions(actions)
+        encoded_actions = self.encode_actions(actions, lengths)
         next_observation = self.predictor(encoded_pixels, encoded_actions)
-        decoded_actions = self.decode_actions(actions, encoded_actions)
+        decoded_actions = self.decode_actions(actions, encoded_actions, lengths)
 
         return next_observation, encoded_actions, decoded_actions
+
+    def forward(self, pixels, actions, lengths=None):
+        return self.predict(pixels, actions, lengths)
     

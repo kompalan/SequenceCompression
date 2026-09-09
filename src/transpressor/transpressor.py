@@ -25,20 +25,22 @@ class ActionDataset(Dataset):
         self.context_length = context_length
         self._h5 = h5py.File(self.h5_file, "r")
 
-        with h5py.File(h5_file, "r") as f:
-            self.length = len(self._h5["action"]) - self.context_length # type: ignore
+        ep_offset = self._h5["ep_offset"][:] # type: ignore
+        ep_len = self._h5["ep_len"][:] # type: ignore
+        indices = []
+        for offset, length in zip(ep_offset, ep_len):
+            if length > self.context_length:
+                indices.extend(range(int(offset), int(offset) + int(length) - self.context_length))
+        self.indices = indices
+        self.length = len(self.indices)
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        i = idx
+        i = int(self.indices[idx])
         actions = torch.tensor(self._h5["action"][i:i + self.context_length], dtype=torch.float32) # type: ignore
         actions = actions.unsqueeze(0).expand(self.context_length, self.context_length, -1)  # Expand to (context_length, context_length, action_dim)
-
-        # Create an upper triangular mask with 1's on the off diagonal and 0's on the diagonal and below
-        mask = torch.triu(torch.ones(self.context_length, self.context_length), diagonal=1).bool().unsqueeze(-1)  # Shape: (context_length, context_length, 1)
-        actions = actions.masked_fill(mask, -3.0)  # Fill the masked positions with -3.0
 
         start_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), -2.0)
         end_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), -3.0)
@@ -88,6 +90,22 @@ def action_dataloader(h5_file, context_length, batch_size, distributed=False):
 
     return train, test, train_sampler
 
+def build_prefix_masks(context_length):
+    """Structural (data-independent) validity info for the all-prefixes-per-window trick.
+
+    Row r of a window represents the first r+1 actions as real. encoder_lengths[r] is the
+    true length of the (START + actions) input sequence for row r. target_valid[r] marks
+    which target positions are real predictions for row r (the END delimiter is only a
+    meaningful target on the row that is genuinely the full window).
+    """
+    encoder_lengths = torch.arange(context_length) + 2
+    target_valid = torch.zeros(context_length, context_length + 1, dtype=torch.bool)
+    r = torch.arange(context_length)
+    k = torch.arange(context_length)
+    target_valid[:, :context_length] = (k.unsqueeze(0) <= r.unsqueeze(1))
+    target_valid[context_length - 1, context_length] = True
+    return encoder_lengths, target_valid
+
 # -- Setup --
 conf = OmegaConf.load("config/transpressor.yaml")
 torch.autograd.set_detect_anomaly(True)
@@ -131,7 +149,7 @@ def reduce_loss(total_loss, batch_count, training_device):
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1]).item()
 
-def compressor_forward(model, input, pixels, target, stage="train"):
+def compressor_forward(model, input, pixels, target, lengths, target_valid, stage="train"):
     """Encode a sequence into a summary vector and train a decoder to reconstruct it."""
 
     if sigreg_term is None:
@@ -144,9 +162,10 @@ def compressor_forward(model, input, pixels, target, stage="train"):
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
-    next_observation, encoded_actions, decoded_actions = model(pixels, input)
+    next_observation, encoded_actions, decoded_actions = model(pixels, input, lengths)
 
-    mse_loss = F.mse_loss(decoded_actions, target)
+    valid = target_valid.unsqueeze(-1).expand_as(target)
+    mse_loss = (decoded_actions - target).square().masked_select(valid).mean()
     action_sigreg_loss = sigreg_term(encoded_actions)
 
     # Predict the next action token from the summary plus the preceding context.
@@ -265,6 +284,10 @@ def train():
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
+    encoder_lengths, target_valid = build_prefix_masks(context_length)
+    encoder_lengths = encoder_lengths.to(training_device)
+    target_valid = target_valid.to(training_device)
+
     global_step = 0
     for epoch in range(n_epochs):
         if train_sampler is not None:
@@ -274,12 +297,15 @@ def train():
         train_loss = 0.0
         train_iterator = tqdm(train_loader, desc="Training", disable=not is_main_process)
         for batch in train_iterator:
+            B = batch["input"].shape[0]
             input = batch["input"].flatten(0, 1).to(training_device)
             target = batch["target"].flatten(0, 1).to(training_device)
             pixels = batch["pixels"].flatten(0, 1).to(training_device)
+            batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
+            batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
 
             optimizer.zero_grad()
-            preds = compressor_forward(model, input, pixels, target, stage="train")
+            preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, stage="train")
             loss = preds["loss"]
 
             loss.backward()
@@ -299,11 +325,14 @@ def train():
         with torch.no_grad():
             val_iterator = tqdm(val_loader, desc="Validation", disable=not is_main_process)
             for batch in val_iterator:
+                B = batch["input"].shape[0]
                 input = batch["input"].flatten(0, 1).to(training_device)
                 target = batch["target"].flatten(0, 1).to(training_device)
                 pixels = batch["pixels"].flatten(0, 1).to(training_device)
-                
-                preds = compressor_forward(model, input, pixels, target, stage="val")
+                batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
+                batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
+
+                preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, stage="val")
                 val_loss += preds["loss"].item()
 
         train_loss = reduce_loss(train_loss, len(train_loader), training_device)
