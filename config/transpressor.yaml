@@ -27,9 +27,10 @@ ar_predictor:
   emb_dropout: 0.0
 
 pixel_preprocessor:
-  model_name: "facebook/dino-vits14"
+  model_name: "facebook/dinov2-small"
+
 pixel_encoder:
-  model_name: "facebook/dino-vits14"
+  model_name: "facebook/dinov2-small"
 
 datapath: "data/pusht_expert_train.h5"
 

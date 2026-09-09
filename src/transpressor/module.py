@@ -398,9 +398,18 @@ class JEPA(nn.Module):
         self.predictor = predictor
 
     def encode_pixels(self, pixels):
-        processed_pixels = self.preprocessor(pixels, return_tensors="pt")
+        """
+        pixels: (batch, 2, H, W, C) paired (start, end) observation frames, float values in [0, 255].
+        Returns per-frame token embeddings: (batch, 2, num_tokens, hidden_size).
+        """
+        batch, pair, h, w, c = pixels.shape
+        images = pixels.reshape(batch * pair, h, w, c).to(torch.uint8).cpu().numpy()
+        processed_pixels = self.preprocessor(list(images), return_tensors="pt")
+        processed_pixels = {k: v.to(pixels.device) for k, v in processed_pixels.items()}
+
         encoded_pixels = self.pixel_encoder(**processed_pixels).last_hidden_state
         encoded_pixels = self.pixel_projector(encoded_pixels)
+        encoded_pixels = encoded_pixels.reshape(batch, pair, *encoded_pixels.shape[1:])
 
         return encoded_pixels
 
@@ -411,9 +420,11 @@ class JEPA(nn.Module):
         return self.action_encoder.decode(actions, conditions, lengths)
 
     def predict(self, pixels, actions, lengths=None):
+        # encoded_pixels holds both the start and end frame's token embeddings; the predictor
+        # is conditioned on the start (current) frame to predict the next observation.
         encoded_pixels = self.encode_pixels(pixels)
         encoded_actions = self.encode_actions(actions, lengths)
-        next_observation = self.predictor(encoded_pixels, encoded_actions)
+        next_observation = self.predictor(encoded_pixels[:, 0], encoded_actions)
         decoded_actions = self.decode_actions(actions, encoded_actions, lengths)
 
         return next_observation, encoded_actions, decoded_actions
