@@ -351,7 +351,7 @@ def train():
     for m in model.modules():
         m.register_forward_hook(nan_hook)
 
-    optimizer = AdamW(model.parameters(), lr=lr)
+    optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=lr)
 
     global_step = 0
     for epoch in range(n_epochs):

@@ -397,6 +397,16 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.predictor = predictor
 
+        # The pixel encoder is a frozen, pretrained backbone - never updated by the optimizer.
+        for param in self.pixel_encoder.parameters():
+            param.requires_grad = False
+        self.pixel_encoder.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.pixel_encoder.eval()  # stay frozen regardless of the rest of the model's mode
+        return self
+
     def encode_pixels(self, pixels):
         """
         pixels: (B, T, H, W, C) - a chain of T observation frames, float values in [0, 255].
