@@ -383,14 +383,12 @@ class Transpressor(nn.Module):
 class JEPA(nn.Module):
     def __init__(
             self,
-            preprocessor,
-            pixel_encoder, 
-            action_encoder, 
+            pixel_encoder,
+            action_encoder,
             predictor
     ):
         super().__init__()
 
-        self.preprocessor = preprocessor
         self.pixel_encoder = pixel_encoder
         self.pixel_projector = MLP(self.pixel_encoder.config.hidden_size, self.pixel_encoder.config.hidden_size*2)
 
@@ -409,15 +407,16 @@ class JEPA(nn.Module):
 
     def encode_pixels(self, pixels):
         """
-        pixels: (B, T, H, W, C) - a chain of T observation frames, float values in [0, 255].
+        pixels: (B, T, C, H, W) - a chain of T observation frames, already resized/cropped/
+        normalized by the real HF preprocessor (done in chain_collate_fn, inside the
+        DataLoader workers, so this CPU-bound step overlaps with GPU compute instead of
+        blocking the forward pass).
         Returns CLS-pooled, per-frame embeddings: (B, T, hidden_size).
         """
-        B, T, h, w, c = pixels.shape
-        images = pixels.reshape(B * T, h, w, c).to(torch.uint8).cpu().numpy()
-        processed_pixels = self.preprocessor(list(images), return_tensors="pt")
-        processed_pixels = {k: v.to(pixels.device) for k, v in processed_pixels.items()}
+        B, T, c, h, w = pixels.shape
+        images = pixels.reshape(B * T, c, h, w)
 
-        encoded_pixels = self.pixel_encoder(**processed_pixels).last_hidden_state[:, 0, :]  # CLS token
+        encoded_pixels = self.pixel_encoder(pixel_values=images).last_hidden_state[:, 0, :]  # CLS token
         encoded_pixels = self.pixel_projector(encoded_pixels)
 
         return encoded_pixels.reshape(B, T, -1)

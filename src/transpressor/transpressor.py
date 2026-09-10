@@ -1,4 +1,5 @@
 import os
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -115,8 +116,16 @@ class ChainDataset(Dataset):
             "hop_lengths": torch.tensor(hop_lengths, dtype=torch.long),
         }
 
-def chain_collate_fn(batch):
+def chain_collate_fn(batch, preprocessor):
     pixels = torch.stack([item["pixels"] for item in batch], dim=0)  # (B, T, H, W, C)
+
+    # Runs the real HF preprocessor (resize/crop/rescale/normalize) here, inside the DataLoader
+    # worker process, instead of in JEPA.encode_pixels inside the model's forward pass - this
+    # CPU-bound step now overlaps with GPU compute rather than blocking it every step.
+    B, T, H, W, C = pixels.shape
+    images = pixels.reshape(B * T, H, W, C).to(torch.uint8).numpy()
+    processed = preprocessor(list(images), return_tensors="pt")["pixel_values"]  # (B*T, C, crop, crop)
+    pixels = processed.reshape(B, T, *processed.shape[1:])  # (B, T, C, crop, crop)
 
     all_inputs = [hop for item in batch for hop in item["hop_inputs"]]
     all_targets = [hop for item in batch for hop in item["hop_targets"]]
@@ -131,8 +140,9 @@ def chain_collate_fn(batch):
         "hop_lengths": hop_lengths,
     }
 
-def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, num_workers=0, pin_memory=False, distributed=False):
+def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, preprocessor, num_workers=0, pin_memory=False, distributed=False):
     dataset = ChainDataset(h5_file, num_frames, max_hop_length)
+    collate_fn = partial(chain_collate_fn, preprocessor=preprocessor)
 
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
@@ -151,7 +161,7 @@ def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, num_worker
         shuffle=train_sampler is None,
         sampler=train_sampler,
         drop_last=True,
-        collate_fn=chain_collate_fn,
+        collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
@@ -162,7 +172,7 @@ def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, num_worker
         shuffle=False,
         sampler=test_sampler,
         drop_last=True,
-        collate_fn=chain_collate_fn,
+        collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
@@ -313,11 +323,16 @@ def train():
     is_main_process = rank == 0
     if is_main_process:
         print(f"Training on {training_device}")
+
+    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
+    pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
+
     train_loader, val_loader, train_sampler = chain_dataloader(
         conf.datapath,
         num_frames=num_frames,
         max_hop_length=max_hop_length,
         batch_size=batch_size,
+        preprocessor=pixel_preprocessor,
         num_workers=num_workers,
         pin_memory=(training_device.type == "cuda"),
         distributed=distributed,
@@ -335,9 +350,6 @@ def train():
         sequence_dim=max_hop_length + 1,
         output_proj=conf.transpressor.output_proj
     ).to(training_device)
-
-    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
-    pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
 
     predictor = ARPredictor(
         # x for the chain predictor is the pixel encoder's own CLS-pooled embedding, so its
@@ -360,7 +372,6 @@ def train():
     ).to(training_device)
 
     model = JEPA(
-        preprocessor=pixel_preprocessor,
         pixel_encoder=pixel_encoder,
         action_encoder=action_encoder,
         predictor=predictor
