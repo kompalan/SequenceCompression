@@ -1,6 +1,6 @@
 n_epochs: 100
 lr: 1e-5
-batch_size: 16 # each chain item costs num_frames real DINOv2 forward passes - revisit once profiled
+batch_size: 200 # each chain item costs num_frames real DINOv2 forward passes - revisit once profiled
 num_frames: 4
 max_hop_length: 8
 log_to_wandb: False
@@ -40,4 +40,6 @@ pixel_encoder:
 
 datapath: "data/pusht_expert_train.h5"
 
-device: "cpu"
+device: "mps"
+
+world_size: 1

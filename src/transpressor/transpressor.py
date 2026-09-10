@@ -43,7 +43,7 @@ class ChainDataset(Dataset):
         ep_len = self._h5["ep_len"][:] # type: ignore
         starts = []
         ends = []
-        for offset, length in zip(ep_offset, ep_len):
+        for offset, length in zip(ep_offset, ep_len): # type: ignore
             offset = int(offset)
             length = int(length)
             if length >= self.num_frames:
@@ -172,14 +172,11 @@ sigreg_term: SIGReg | None = None
 
 
 def setup_distributed():
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    world_size = int(os.environ.get("WORLD_SIZE", str(conf.world_size)))
     rank = int(os.environ.get("RANK", "0"))
     distributed = world_size > 1
     if distributed and device != "cpu":
-        raise RuntimeError(
-            f"Distributed training is only supported on CPU, but device is configured as {device!r}. "
-            "Run a single process to train on MPS."
-        )
+        print(f"WARNING: Distributed training is enabled, but device is set to {device}.")
     if distributed:
         master_port = os.environ.get("MASTER_PORT", "29500")
         dist.init_process_group(
@@ -341,7 +338,7 @@ def train():
         pixel_encoder=pixel_encoder,
         action_encoder=action_encoder,
         predictor=predictor
-    )
+    ).to(device=training_device)
 
     if distributed:
         model = DistributedDataParallel(model)
