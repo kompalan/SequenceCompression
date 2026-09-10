@@ -7,6 +7,7 @@ import h5py
 import torch.distributed as dist
 
 from torch.nn.parallel import DistributedDataParallel
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
@@ -22,54 +23,113 @@ from transformers import AutoImageProcessor, AutoModel
 START_VALUE = -2.0
 END_VALUE = -3.0
 
-class ActionDataset(Dataset):
-    def __init__(self, h5_file, context_length):
+class ChainDataset(Dataset):
+    """A chain of num_frames observations connected by num_frames-1 variable-length action hops.
+
+    Each hop's length is resampled fresh on every __getitem__ call, so the same start index
+    yields different hop lengths across epochs.
+    """
+
+    def __init__(self, h5_file, num_frames, max_hop_length):
+        assert num_frames >= 2, "num_frames must be >= 2 (need at least one hop)"
+        assert max_hop_length >= 1, "max_hop_length must be >= 1"
+
         self.h5_file = h5_file
-        self.context_length = context_length
+        self.num_frames = num_frames
+        self.max_hop_length = max_hop_length
         self._h5 = h5py.File(self.h5_file, "r")
 
         ep_offset = self._h5["ep_offset"][:] # type: ignore
         ep_len = self._h5["ep_len"][:] # type: ignore
-        indices = []
+        starts = []
+        ends = []
         for offset, length in zip(ep_offset, ep_len):
-            if length > self.context_length:
-                indices.extend(range(int(offset), int(offset) + int(length) - self.context_length))
-        self.indices = indices
-        self.length = len(self.indices)
+            offset = int(offset)
+            length = int(length)
+            if length >= self.num_frames:
+                episode_end = offset + length - 1
+                for i1 in range(offset, episode_end - (self.num_frames - 1) + 1):
+                    starts.append(i1)
+                    ends.append(episode_end)
+        self.starts = starts
+        self.ends = ends
 
     def __len__(self):
-        return self.length
+        return len(self.starts)
+
+    def _sample_hop_lengths(self, i1, episode_end):
+        """Reservation-based sampling: reserves >=1 action for every hop still to come, so the
+        sampled range for each hop length is always non-empty - no rejection sampling needed."""
+        n_hops = self.num_frames - 1
+        lengths = []
+        i_t = i1
+        for t in range(n_hops):
+            hops_after = n_hops - (t + 1)
+            upper = min(self.max_hop_length, (episode_end - i_t) - hops_after)
+            length = int(torch.randint(1, upper + 1, (1,)).item())
+            lengths.append(length)
+            i_t += length
+        return lengths
 
     def __getitem__(self, idx):
-        i = int(self.indices[idx])
-        actions = torch.tensor(self._h5["action"][i:i + self.context_length], dtype=torch.float32) # type: ignore
-        actions = actions.unsqueeze(0).expand(self.context_length, self.context_length, -1)  # Expand to (context_length, context_length, action_dim)
+        i1 = self.starts[idx]
+        episode_end = self.ends[idx]
+        hop_lengths_raw = self._sample_hop_lengths(i1, episode_end)
 
-        start_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), START_VALUE)
-        end_padding = torch.full((actions.shape[1], 1, actions.shape[-1]), END_VALUE)
-        input_seq_with_delimiters = torch.cat([start_padding, actions, end_padding], dim=1)
+        frame_indices = [i1]
+        i_t = i1
+        for length in hop_lengths_raw:
+            i_t += length
+            frame_indices.append(i_t)
 
-        input = input_seq_with_delimiters[:, :-1, :]
-        target = input_seq_with_delimiters[:, 1:, :]
+        pixels = torch.tensor(self._h5["pixels"][frame_indices], dtype=torch.float32)  # type: ignore
 
-        # Row r has r + 1 actions unmasked, so its observations are the
-        # initial state (index i) and the state after r + 1 actions
-        # (index i + r + 1).
-        start_pixels = torch.tensor(self._h5["pixels"][i], dtype=torch.float32)  # type: ignore
-        end_pixels = torch.tensor(self._h5["pixels"][i + 1:i + self.context_length + 1], dtype=torch.float32)  # type: ignore
-        start_pixels = start_pixels.unsqueeze(0).expand(self.context_length, *start_pixels.shape)
-        pixels = torch.stack([start_pixels, end_pixels], dim=1)  # Shape: (context_length, 2, H, W, C)
+        hop_inputs = []
+        hop_targets = []
+        hop_lengths = []
+        i_t = i1
+        for length in hop_lengths_raw:
+            actions = torch.tensor(self._h5["action"][i_t:i_t + length], dtype=torch.float32)  # type: ignore
+            start_padding = torch.full((1, actions.shape[-1]), START_VALUE)
+            end_padding = torch.full((1, actions.shape[-1]), END_VALUE)
+            seq = torch.cat([start_padding, actions, end_padding], dim=0)  # (length+2, action_dim)
 
-        return {"input": input, "target": target, "pixels": pixels}
+            hop_inputs.append(seq[:-1])   # START, a_0..a_{length-1}
+            hop_targets.append(seq[1:])   # a_0..a_{length-1}, END
+            hop_lengths.append(length + 1)  # START + length actions
+            i_t += length
 
-def action_dataloader(h5_file, context_length, batch_size, distributed=False):
-    dataset = ActionDataset(h5_file, context_length)
+        return {
+            "pixels": pixels,
+            "hop_inputs": hop_inputs,
+            "hop_targets": hop_targets,
+            "hop_lengths": torch.tensor(hop_lengths, dtype=torch.long),
+        }
+
+def chain_collate_fn(batch):
+    pixels = torch.stack([item["pixels"] for item in batch], dim=0)  # (B, T, H, W, C)
+
+    all_inputs = [hop for item in batch for hop in item["hop_inputs"]]
+    all_targets = [hop for item in batch for hop in item["hop_targets"]]
+    hop_input = pad_sequence(all_inputs, batch_first=True)    # (B*(T-1), max_len, action_dim)
+    hop_target = pad_sequence(all_targets, batch_first=True)  # (B*(T-1), max_len, action_dim)
+    hop_lengths = torch.cat([item["hop_lengths"] for item in batch], dim=0)  # (B*(T-1),)
+
+    return {
+        "pixels": pixels,
+        "hop_input": hop_input,
+        "hop_target": hop_target,
+        "hop_lengths": hop_lengths,
+    }
+
+def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, distributed=False):
+    dataset = ChainDataset(h5_file, num_frames, max_hop_length)
 
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
 
     train_dataset, test_dataset = random_split(
-        dataset, 
+        dataset,
         [train_size, test_size],
         generator=torch.Generator().manual_seed(42) # For reproducibility
     )
@@ -82,6 +142,7 @@ def action_dataloader(h5_file, context_length, batch_size, distributed=False):
         shuffle=train_sampler is None,
         sampler=train_sampler,
         drop_last=True,
+        collate_fn=chain_collate_fn,
     )
     test = DataLoader(
         test_dataset,
@@ -89,29 +150,10 @@ def action_dataloader(h5_file, context_length, batch_size, distributed=False):
         shuffle=False,
         sampler=test_sampler,
         drop_last=True,
+        collate_fn=chain_collate_fn,
     )
 
     return train, test, train_sampler
-
-def build_prefix_masks(context_length):
-    """Structural (data-independent) validity info for the all-prefixes-per-window trick.
-
-    Row r of a window treats the first r+1 actions as a complete, self-terminating
-    sequence: START, a_0..a_r, END. encoder_lengths[r] is the true length of the
-    (START + actions) input sequence for row r. target_valid[r] marks which target
-    positions are real predictions for row r: the r+1 real actions, plus the position
-    immediately after them, which should predict END. END only lives at a fixed physical
-    column (the last one) shared by every row, so for every row but the last, that
-    "predict END" position doesn't hold END in the raw data - it holds the window's next
-    real action instead. end_override marks exactly those positions, so the caller can
-    substitute the END value before computing the loss.
-    """
-    encoder_lengths = torch.arange(context_length) + 2
-    r = torch.arange(context_length)
-    k = torch.arange(context_length + 1)
-    target_valid = (k.unsqueeze(0) <= r.unsqueeze(1)) | (k.unsqueeze(0) == (r + 1).unsqueeze(1))
-    end_override = (k.unsqueeze(0) == (r + 1).unsqueeze(1)) & (k.unsqueeze(0) < context_length)
-    return encoder_lengths, target_valid, end_override
 
 # -- Setup --
 conf = OmegaConf.load("config/transpressor.yaml")
@@ -120,7 +162,8 @@ torch.autograd.set_detect_anomaly(True)
 n_epochs = conf.n_epochs
 lr = conf.lr
 batch_size = conf.batch_size
-context_length = conf.context_length
+num_frames = conf.num_frames
+max_hop_length = conf.max_hop_length
 log_to_wandb = conf.log_to_wandb
 datapath = conf.datapath
 
@@ -156,8 +199,10 @@ def reduce_loss(total_loss, batch_count, training_device):
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1]).item()
 
-def compressor_forward(model, input, pixels, target, lengths, target_valid, end_override, stage="train"):
-    """Encode a sequence into a summary vector and train a decoder to reconstruct it."""
+def chain_forward(model, batch, weights, stage="train"):
+    """Run a chain batch through JEPA and compute the combined loss:
+    per-hop action reconstruction, chain observation prediction, and two SIGReg terms.
+    """
 
     if sigreg_term is None:
         raise RuntimeError("SIGReg must be initialized before training")
@@ -169,32 +214,33 @@ def compressor_forward(model, input, pixels, target, lengths, target_valid, end_
     else:
         raise ValueError(f"Unknown stage: {stage}")
 
-    next_observation, encoded_actions, decoded_actions = model(pixels, input, lengths)
+    out = model(batch["pixels"], batch["hop_input"], batch["hop_lengths"])
 
-    # Every prefix row is trained as its own complete, self-terminating sequence, so the
-    # position right after a row's last real action must be compared against END - even
-    # though the raw window data holds the window's next real action there instead.
-    target = target.masked_fill(end_override.unsqueeze(-1).expand_as(target), END_VALUE)
+    padded_width = batch["hop_target"].shape[1]
+    target_valid = torch.arange(padded_width, device=batch["hop_lengths"].device).unsqueeze(0) \
+        < batch["hop_lengths"].unsqueeze(1)
+    valid = target_valid.unsqueeze(-1).expand_as(out["decoded_actions"])
+    hop_mse_loss = (out["decoded_actions"] - batch["hop_target"]).square().masked_select(valid).mean()
 
-    valid = target_valid.unsqueeze(-1).expand_as(target)
-    mse_loss = (decoded_actions - target).square().masked_select(valid).mean()
-    action_sigreg_loss = sigreg_term(encoded_actions)
+    chain_mse_loss = F.mse_loss(out["pred"], out["target"])
+    # (T-1, B, D_cond) / (T, B, D): groups by chain position, giving genuine B-sample groups.
+    action_sigreg_loss = sigreg_term(out["hop_emb"].transpose(0, 1))
+    obs_sigreg_loss = sigreg_term(out["obs"].transpose(0, 1))
 
-    # Predict the next action token from the summary plus the preceding context.
-    # Take the first seq_len-1 tokens and compare it to a shifted version of actions[1:]
-    loss = mse_loss + action_sigreg_loss
+    loss = (
+        weights.hop_mse * hop_mse_loss
+        + weights.chain_mse * chain_mse_loss
+        + weights.action_sigreg * action_sigreg_loss
+        + weights.obs_sigreg * obs_sigreg_loss
+    )
 
-    output = {
-        "actions": input,
-        "compressed": encoded_actions,
-        "decompressed": decoded_actions,
-        "next_observation": next_observation,
+    return {
         "loss": loss,
-        "mse_loss": mse_loss,
-        "sigreg_loss": action_sigreg_loss
+        "hop_mse_loss": hop_mse_loss,
+        "chain_mse_loss": chain_mse_loss,
+        "action_sigreg_loss": action_sigreg_loss,
+        "obs_sigreg_loss": obs_sigreg_loss,
     }
-
-    return output
 
 def nan_hook(module, inp, out):
     if isinstance(out, torch.Tensor) and not torch.isfinite(out).all():
@@ -213,8 +259,10 @@ if log_to_wandb and int(os.environ.get("RANK", "0")) == 0:
             "architecture": "Transformer",
             "dataset": conf.datapath,
             "epochs": n_epochs,
-            "context_length": context_length,
+            "num_frames": num_frames,
+            "max_hop_length": max_hop_length,
             "batch_size": batch_size,
+            "loss_weights": dict(conf.loss_weights),
             "transpressor_input_dim": conf.transpressor.input_dim,
             "transpressor_hidden_dim": conf.transpressor.hidden_dim,
             "transpressor_condition_dim": conf.transpressor.condition_dim,
@@ -224,7 +272,6 @@ if log_to_wandb and int(os.environ.get("RANK", "0")) == 0:
             "transpressor_mlp_dim": conf.transpressor.mlp_dim,
             "transpressor_dropout": conf.transpressor.dropout,
             "transpressor_output_proj": conf.transpressor.output_proj,
-            "ar_predictor_input_dim": conf.ar_predictor.input_dim,
             "ar_predictor_hidden_dim": conf.ar_predictor.hidden_dim,
             "ar_predictor_condition_dim": conf.ar_predictor.condition_dim,
             "ar_predictor_depth": conf.ar_predictor.depth,
@@ -245,36 +292,32 @@ def train():
     is_main_process = rank == 0
     if is_main_process:
         print(f"Training on {training_device}")
-    train_loader, val_loader, train_sampler = action_dataloader(
+    train_loader, val_loader, train_sampler = chain_dataloader(
         conf.datapath,
-        context_length=context_length,
+        num_frames=num_frames,
+        max_hop_length=max_hop_length,
         batch_size=batch_size,
         distributed=distributed,
     )
 
-    # -- Model definition -- 
+    # -- Model definition --
     action_encoder = Transpressor(
-        input_dim=conf.transpressor.input_dim, 
-        hidden_dim=conf.transpressor.hidden_dim, 
-        condition_dim=conf.transpressor.condition_dim, 
-        depth=conf.transpressor.depth, 
+        input_dim=conf.transpressor.input_dim,
+        hidden_dim=conf.transpressor.hidden_dim,
+        condition_dim=conf.transpressor.condition_dim,
+        depth=conf.transpressor.depth,
         heads=conf.transpressor.heads,
-        dim_head=conf.transpressor.dim_head, 
-        mlp_dim=conf.transpressor.mlp_dim, 
-        sequence_dim=context_length,
+        dim_head=conf.transpressor.dim_head,
+        mlp_dim=conf.transpressor.mlp_dim,
+        sequence_dim=max_hop_length + 1,
         output_proj=conf.transpressor.output_proj
     ).to(training_device)
 
     pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
     pixel_encoder = AutoModel.from_pretrained(conf.pixel_encoder.model_name)
 
-    # ARPredictor attends over the pixel encoder's own patch-token sequence (CLS + patches,
-    # standard ViT/DINOv2 layout), so its positional-embedding table must be sized to match
-    # that model's real token count rather than an arbitrary default.
-    pixel_sequence_dim = (pixel_encoder.config.image_size // pixel_encoder.config.patch_size) ** 2 + 1
-
     predictor = ARPredictor(
-        # x for ARPredictor's decoder is the pixel encoder's own token embeddings, so its
+        # x for the chain predictor is the pixel encoder's own CLS-pooled embedding, so its
         # feature dim must track the pixel encoder's hidden size, not conf.ar_predictor.input_dim
         # (which is the action dim and unrelated to this path).
         input_dim=pixel_encoder.config.hidden_size,
@@ -285,7 +328,8 @@ def train():
         dim_head=conf.ar_predictor.dim_head,
         mlp_dim=conf.ar_predictor.mlp_dim,
         dropout=conf.ar_predictor.dropout,
-        sequence_dim=pixel_sequence_dim,
+        # The chain predictor attends over num_frames-1 hop-conditioned observation positions.
+        sequence_dim=num_frames - 1,
         # ARPredictor is conditioned on encoded_actions, i.e. the action encoder's own
         # output, so its conditioning-input dimensionality must track the same output_proj
         # flag that determines that output's shape (condition_dim vs hidden_dim).
@@ -309,11 +353,6 @@ def train():
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
-    encoder_lengths, target_valid, end_override = build_prefix_masks(context_length)
-    encoder_lengths = encoder_lengths.to(training_device)
-    target_valid = target_valid.to(training_device)
-    end_override = end_override.to(training_device)
-
     global_step = 0
     for epoch in range(n_epochs):
         if train_sampler is not None:
@@ -323,16 +362,10 @@ def train():
         train_loss = 0.0
         train_iterator = tqdm(train_loader, desc="Training", disable=not is_main_process)
         for batch in train_iterator:
-            B = batch["input"].shape[0]
-            input = batch["input"].flatten(0, 1).to(training_device)
-            target = batch["target"].flatten(0, 1).to(training_device)
-            pixels = batch["pixels"].flatten(0, 1).to(training_device)
-            batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
-            batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
-            batch_end_override = end_override.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
+            batch = {k: v.to(training_device) for k, v in batch.items()}
 
             optimizer.zero_grad()
-            preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, batch_end_override, stage="train")
+            preds = chain_forward(model, batch, conf.loss_weights, stage="train")
             loss = preds["loss"]
 
             loss.backward()
@@ -342,8 +375,10 @@ def train():
             if is_main_process and log_to_wandb:
                 run.log({
                     "train/loss": loss.item(),
-                    "train/mse_loss": preds["mse_loss"].item(),
-                    "train/sigreg_loss": preds["sigreg_loss"].item(),
+                    "train/hop_mse_loss": preds["hop_mse_loss"].item(),
+                    "train/chain_mse_loss": preds["chain_mse_loss"].item(),
+                    "train/action_sigreg_loss": preds["action_sigreg_loss"].item(),
+                    "train/obs_sigreg_loss": preds["obs_sigreg_loss"].item(),
                 }, step=global_step)
             global_step += 1
 
@@ -352,15 +387,9 @@ def train():
         with torch.no_grad():
             val_iterator = tqdm(val_loader, desc="Validation", disable=not is_main_process)
             for batch in val_iterator:
-                B = batch["input"].shape[0]
-                input = batch["input"].flatten(0, 1).to(training_device)
-                target = batch["target"].flatten(0, 1).to(training_device)
-                pixels = batch["pixels"].flatten(0, 1).to(training_device)
-                batch_lengths = encoder_lengths.unsqueeze(0).expand(B, -1).flatten(0, 1)
-                batch_valid = target_valid.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
-                batch_end_override = end_override.unsqueeze(0).expand(B, -1, -1).flatten(0, 1)
+                batch = {k: v.to(training_device) for k, v in batch.items()}
 
-                preds = compressor_forward(model, input, pixels, target, batch_lengths, batch_valid, batch_end_override, stage="val")
+                preds = chain_forward(model, batch, conf.loss_weights, stage="val")
                 val_loss += preds["loss"].item()
 
         train_loss = reduce_loss(train_loss, len(train_loader), training_device)

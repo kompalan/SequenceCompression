@@ -399,19 +399,18 @@ class JEPA(nn.Module):
 
     def encode_pixels(self, pixels):
         """
-        pixels: (batch, 2, H, W, C) paired (start, end) observation frames, float values in [0, 255].
-        Returns per-frame token embeddings: (batch, 2, num_tokens, hidden_size).
+        pixels: (B, T, H, W, C) - a chain of T observation frames, float values in [0, 255].
+        Returns CLS-pooled, per-frame embeddings: (B, T, hidden_size).
         """
-        batch, pair, h, w, c = pixels.shape
-        images = pixels.reshape(batch * pair, h, w, c).to(torch.uint8).cpu().numpy()
+        B, T, h, w, c = pixels.shape
+        images = pixels.reshape(B * T, h, w, c).to(torch.uint8).cpu().numpy()
         processed_pixels = self.preprocessor(list(images), return_tensors="pt")
         processed_pixels = {k: v.to(pixels.device) for k, v in processed_pixels.items()}
 
-        encoded_pixels = self.pixel_encoder(**processed_pixels).last_hidden_state
+        encoded_pixels = self.pixel_encoder(**processed_pixels).last_hidden_state[:, 0, :]  # CLS token
         encoded_pixels = self.pixel_projector(encoded_pixels)
-        encoded_pixels = encoded_pixels.reshape(batch, pair, *encoded_pixels.shape[1:])
 
-        return encoded_pixels
+        return encoded_pixels.reshape(B, T, -1)
 
     def encode_actions(self, actions, lengths=None):
         return self.action_encoder.encode(actions, lengths)
@@ -419,16 +418,33 @@ class JEPA(nn.Module):
     def decode_actions(self, actions, conditions, lengths=None):
         return self.action_encoder.decode(actions, conditions, lengths)
 
-    def predict(self, pixels, actions, lengths=None):
-        # encoded_pixels holds both the start and end frame's token embeddings; the predictor
-        # is conditioned on the start (current) frame to predict the next observation.
-        encoded_pixels = self.encode_pixels(pixels)
-        encoded_actions = self.encode_actions(actions, lengths)
-        next_observation = self.predictor(encoded_pixels[:, 0], encoded_actions)
-        decoded_actions = self.decode_actions(actions, encoded_actions, lengths)
+    def predict(self, pixels, hop_input, hop_lengths=None):
+        """
+        pixels: (B, T, H, W, C) - the chain's T observation frames.
+        hop_input: (B*(T-1), max_len, action_dim) - the T-1 hops between them, flattened.
+        hop_lengths: (B*(T-1),) - each hop's true (START + actions) length.
+        """
+        B, T = pixels.shape[0], pixels.shape[1]
 
-        return next_observation, encoded_actions, decoded_actions
+        obs = self.encode_pixels(pixels)  # (B, T, D)
 
-    def forward(self, pixels, actions, lengths=None):
-        return self.predict(pixels, actions, lengths)
+        hop_emb_flat = self.encode_actions(hop_input, hop_lengths)  # (B*(T-1), 1, D_cond)
+        hop_emb = hop_emb_flat.squeeze(1).reshape(B, T - 1, -1)  # (B, T-1, D_cond)
+
+        x, target = obs[:, :-1], obs[:, 1:]  # (B, T-1, D) each
+        pred = self.predictor(x, hop_emb)  # per-position AdaLN: hop_emb[:,t] conditions x[:,t]
+
+        decoded_actions = self.decode_actions(hop_input, hop_emb_flat, hop_lengths)
+
+        return {
+            "obs": obs,
+            "pred": pred,
+            "target": target,
+            "hop_emb": hop_emb,
+            "hop_emb_flat": hop_emb_flat,
+            "decoded_actions": decoded_actions,
+        }
+
+    def forward(self, pixels, hop_input, hop_lengths=None):
+        return self.predict(pixels, hop_input, hop_lengths)
     
