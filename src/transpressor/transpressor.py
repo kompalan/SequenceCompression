@@ -450,7 +450,9 @@ def train():
                     key.removeprefix("module."): value
                     for key, value in state_dict.items()
                 }
-            torch.save(state_dict, f"checkpoints/transpressor_epoch_{epoch}.pt")
+
+            os.makedirs("checkpoints", exist_ok=True)
+            torch.save(state_dict, f"checkpoints/lewm_epoch_{epoch}.pt")
 
     if distributed:
         dist.destroy_process_group()
