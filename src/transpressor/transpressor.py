@@ -37,13 +37,17 @@ class ChainDataset(Dataset):
         self.h5_file = h5_file
         self.num_frames = num_frames
         self.max_hop_length = max_hop_length
-        self._h5 = h5py.File(self.h5_file, "r")
+        # h5py file handles aren't fork-safe, so don't keep the one used here around - each
+        # DataLoader worker process opens its own lazily, on its first __getitem__ call.
+        self._h5 = None
 
-        ep_offset = self._h5["ep_offset"][:] # type: ignore
-        ep_len = self._h5["ep_len"][:] # type: ignore
+        with h5py.File(h5_file, "r") as f:
+            ep_offset = f["ep_offset"][:]
+            ep_len = f["ep_len"][:]
+
         starts = []
         ends = []
-        for offset, length in zip(ep_offset, ep_len): # type: ignore
+        for offset, length in zip(ep_offset, ep_len):
             offset = int(offset)
             length = int(length)
             if length >= self.num_frames:
@@ -56,6 +60,10 @@ class ChainDataset(Dataset):
 
     def __len__(self):
         return len(self.starts)
+
+    def _ensure_h5(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_file, "r")
 
     def _sample_hop_lengths(self, i1, episode_end):
         """Reservation-based sampling: reserves >=1 action for every hop still to come, so the
@@ -72,6 +80,7 @@ class ChainDataset(Dataset):
         return lengths
 
     def __getitem__(self, idx):
+        self._ensure_h5()
         i1 = self.starts[idx]
         episode_end = self.ends[idx]
         hop_lengths_raw = self._sample_hop_lengths(i1, episode_end)
@@ -122,7 +131,7 @@ def chain_collate_fn(batch):
         "hop_lengths": hop_lengths,
     }
 
-def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, distributed=False):
+def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, num_workers=0, pin_memory=False, distributed=False):
     dataset = ChainDataset(h5_file, num_frames, max_hop_length)
 
     train_size = int(0.8 * len(dataset))
@@ -143,6 +152,9 @@ def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, distribute
         sampler=train_sampler,
         drop_last=True,
         collate_fn=chain_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
     test = DataLoader(
         test_dataset,
@@ -151,6 +163,9 @@ def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, distribute
         sampler=test_sampler,
         drop_last=True,
         collate_fn=chain_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
 
     return train, test, train_sampler
@@ -164,6 +179,7 @@ lr = conf.lr
 batch_size = conf.batch_size
 num_frames = conf.num_frames
 max_hop_length = conf.max_hop_length
+num_workers = conf.num_workers
 log_to_wandb = conf.log_to_wandb
 datapath = conf.datapath
 
@@ -174,19 +190,27 @@ sigreg_term: SIGReg | None = None
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", str(conf.world_size)))
     rank = int(os.environ.get("RANK", "0"))
+    # torchrun sets LOCAL_RANK to the GPU index within this node; falls back to rank for
+    # single-node CPU runs launched without torchrun.
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     distributed = world_size > 1
-    if distributed and device != "cpu":
-        print(f"WARNING: Distributed training is enabled, but device is set to {device}.")
+
+    if distributed and device not in ("cpu", "cuda"):
+        print(f"WARNING: Distributed training is only implemented for cpu/cuda backends, but device is set to {device!r}.")
+
     if distributed:
+        backend = "nccl" if device == "cuda" else "gloo"
+        if device == "cuda":
+            torch.cuda.set_device(local_rank)
         master_port = os.environ.get("MASTER_PORT", "29500")
         dist.init_process_group(
-            backend="gloo",
+            backend=backend,
             init_method=f"tcp://127.0.0.1:{master_port}",
             rank=rank,
             world_size=world_size,
         )
 
-    training_device = torch.device(device)
+    training_device = torch.device(f"cuda:{local_rank}") if device == "cuda" else torch.device(device)
     return distributed, rank, training_device
 
 
@@ -294,6 +318,8 @@ def train():
         num_frames=num_frames,
         max_hop_length=max_hop_length,
         batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(training_device.type == "cuda"),
         distributed=distributed,
     )
 
@@ -341,7 +367,10 @@ def train():
     ).to(device=training_device)
 
     if distributed:
-        model = DistributedDataParallel(model)
+        if training_device.type == "cuda":
+            model = DistributedDataParallel(model, device_ids=[training_device.index], output_device=training_device.index)
+        else:
+            model = DistributedDataParallel(model)
 
     sigreg_term = SIGReg().to(device=training_device)
 
@@ -416,5 +445,8 @@ def train():
         dist.destroy_process_group()
         
 if __name__ == "__main__":
-    assert torch.mps.is_available() == True, "MPS is not available!"
+    if device == "mps":
+        assert torch.mps.is_available(), "MPS is not available!"
+    elif device == "cuda":
+        assert torch.cuda.is_available(), "CUDA is not available!"
     train()

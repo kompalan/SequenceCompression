@@ -3,6 +3,7 @@ lr: 1e-5
 batch_size: 200 # each chain item costs num_frames real DINOv2 forward passes - revisit once profiled
 num_frames: 4
 max_hop_length: 8
+num_workers: 4
 log_to_wandb: False
 
 loss_weights:
