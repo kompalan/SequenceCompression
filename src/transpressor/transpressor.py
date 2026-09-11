@@ -270,14 +270,16 @@ def chain_forward(model, batch, weights, stage="train"):
     valid = target_valid.unsqueeze(-1).expand_as(out["decoded_actions"])
     hop_mse_loss = (out["decoded_actions"] - batch["hop_target"]).square().masked_select(valid).mean()
 
-    chain_mse_loss = F.mse_loss(out["pred"], out["target"])
+    # chain_mse_loss = F.mse_loss(out["pred"], out["target"])
+    chain_cosine_loss = 1 - F.cosine_similarity(out["pred"], out["target"], dim=-1).mean()
+
     # (T-1, B, D_cond) / (T, B, D): groups by chain position, giving genuine B-sample groups.
     action_sigreg_loss = sigreg_term(out["hop_emb"].transpose(0, 1))
     obs_sigreg_loss = sigreg_term(out["obs"].transpose(0, 1))
 
     loss = (
         weights.hop_mse * hop_mse_loss
-        + weights.chain_mse * chain_mse_loss
+        + weights.chain_cosine * chain_cosine_loss
         + weights.action_sigreg * action_sigreg_loss
         + weights.obs_sigreg * obs_sigreg_loss
     )
