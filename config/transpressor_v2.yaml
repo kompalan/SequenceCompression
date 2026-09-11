@@ -5,7 +5,7 @@ num_frames: 10
 max_hop_length: 10
 frameskip: 5
 num_workers: 4
-log_to_wandb: True 
+log_to_wandb: False 
 
 loss_weights:
   hop_mse: 1.0
@@ -42,6 +42,6 @@ pixel_encoder:
 
 datapath: "data/pusht_expert_train.h5"
 
-device: "cuda"
+device: "mps"
 
-world_size: 2
+world_size: 1

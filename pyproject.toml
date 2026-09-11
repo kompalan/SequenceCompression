@@ -13,6 +13,7 @@ dependencies = [
     "hdf5plugin>=7.0.0",
     "imageio>=2.37.4",
     "imageio-ffmpeg>=0.6.0",
+    "ipywidgets>=8.1.9",
     "omegaconf>=2.3.1",
     "pillow>=12.3.0",
     "pymunk<7",
