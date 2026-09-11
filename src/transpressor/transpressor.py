@@ -27,17 +27,21 @@ END_VALUE = -3.0
 class ChainDataset(Dataset):
     """A chain of num_frames observations connected by num_frames-1 variable-length action hops.
 
-    Each hop's length is resampled fresh on every __getitem__ call, so the same start index
-    yields different hop lengths across epochs.
+    Each hop is a sequence of macro-steps, not individual raw actions: every macro-step bundles
+    `frameskip` consecutive raw actions concatenated along the feature axis (frameskip=1 recovers
+    the old one-raw-action-per-step behavior). A hop's length (in macro-steps) is resampled fresh
+    on every __getitem__ call, so the same start index yields different hop lengths across epochs.
     """
 
-    def __init__(self, h5_file, num_frames, max_hop_length):
+    def __init__(self, h5_file, num_frames, max_hop_length, frameskip):
         assert num_frames >= 2, "num_frames must be >= 2 (need at least one hop)"
         assert max_hop_length >= 1, "max_hop_length must be >= 1"
+        assert frameskip >= 1, "frameskip must be >= 1"
 
         self.h5_file = h5_file
         self.num_frames = num_frames
         self.max_hop_length = max_hop_length
+        self.frameskip = frameskip
         # h5py file handles aren't fork-safe, so don't keep the one used here around - each
         # DataLoader worker process opens its own lazily, on its first __getitem__ call.
         self._h5 = None
@@ -46,14 +50,17 @@ class ChainDataset(Dataset):
             ep_offset = f["ep_offset"][:]
             ep_len = f["ep_len"][:]
 
+        # Every hop needs at least one macro-step, i.e. at least `frameskip` raw actions, so a
+        # chain of num_frames-1 hops needs at least (num_frames-1)*frameskip raw actions of room.
+        min_raw_span = (self.num_frames - 1) * self.frameskip
         starts = []
         ends = []
         for offset, length in zip(ep_offset, ep_len):
             offset = int(offset)
             length = int(length)
-            if length >= self.num_frames:
+            if length >= min_raw_span + 1:
                 episode_end = offset + length - 1
-                for i1 in range(offset, episode_end - (self.num_frames - 1) + 1):
+                for i1 in range(offset, episode_end - min_raw_span + 1):
                     starts.append(i1)
                     ends.append(episode_end)
         self.starts = starts
@@ -67,29 +74,32 @@ class ChainDataset(Dataset):
             self._h5 = h5py.File(self.h5_file, "r")
 
     def _sample_hop_lengths(self, i1, episode_end):
-        """Reservation-based sampling: reserves >=1 action for every hop still to come, so the
-        sampled range for each hop length is always non-empty - no rejection sampling needed."""
+        """Reservation-based sampling: reserves >=1 macro-step (frameskip raw actions) for every
+        hop still to come, so the sampled range for each hop length is always non-empty - no
+        rejection sampling needed. Lengths are counted in macro-steps, each spanning `frameskip`
+        raw actions."""
         n_hops = self.num_frames - 1
         lengths = []
         i_t = i1
         for t in range(n_hops):
             hops_after = n_hops - (t + 1)
-            upper = min(self.max_hop_length, (episode_end - i_t) - hops_after)
+            raw_budget = episode_end - i_t
+            upper = min(self.max_hop_length, (raw_budget - hops_after * self.frameskip) // self.frameskip)
             length = int(torch.randint(1, upper + 1, (1,)).item())
             lengths.append(length)
-            i_t += length
+            i_t += length * self.frameskip
         return lengths
 
     def __getitem__(self, idx):
         self._ensure_h5()
         i1 = self.starts[idx]
         episode_end = self.ends[idx]
-        hop_lengths_raw = self._sample_hop_lengths(i1, episode_end)
+        hop_lengths_raw = self._sample_hop_lengths(i1, episode_end)  # in macro-steps
 
         frame_indices = [i1]
         i_t = i1
         for length in hop_lengths_raw:
-            i_t += length
+            i_t += length * self.frameskip
             frame_indices.append(i_t)
 
         pixels = torch.tensor(self._h5["pixels"][frame_indices], dtype=torch.float32)  # type: ignore
@@ -99,15 +109,21 @@ class ChainDataset(Dataset):
         hop_lengths = []
         i_t = i1
         for length in hop_lengths_raw:
-            actions = torch.tensor(self._h5["action"][i_t:i_t + length], dtype=torch.float32)  # type: ignore
+            raw_actions = torch.tensor(
+                self._h5["action"][i_t:i_t + length * self.frameskip], dtype=torch.float32  # type: ignore
+            )  # (length*frameskip, action_dim)
+            # Chunk every frameskip consecutive raw actions into one macro-step, concatenated
+            # along the feature axis: (length*frameskip, action_dim) -> (length, frameskip*action_dim).
+            actions = raw_actions.reshape(length, -1)
+
             start_padding = torch.full((1, actions.shape[-1]), START_VALUE)
             end_padding = torch.full((1, actions.shape[-1]), END_VALUE)
-            seq = torch.cat([start_padding, actions, end_padding], dim=0)  # (length+2, action_dim)
+            seq = torch.cat([start_padding, actions, end_padding], dim=0)  # (length+2, frameskip*action_dim)
 
-            hop_inputs.append(seq[:-1])   # START, a_0..a_{length-1}
-            hop_targets.append(seq[1:])   # a_0..a_{length-1}, END
-            hop_lengths.append(length + 1)  # START + length actions
-            i_t += length
+            hop_inputs.append(seq[:-1])   # START, macro-step_0..macro-step_{length-1}
+            hop_targets.append(seq[1:])   # macro-step_0..macro-step_{length-1}, END
+            hop_lengths.append(length + 1)  # START + length macro-steps
+            i_t += length * self.frameskip
 
         return {
             "pixels": pixels,
@@ -140,8 +156,8 @@ def chain_collate_fn(batch, preprocessor):
         "hop_lengths": hop_lengths,
     }
 
-def chain_dataloader(h5_file, num_frames, max_hop_length, batch_size, preprocessor, num_workers=0, pin_memory=False, distributed=False):
-    dataset = ChainDataset(h5_file, num_frames, max_hop_length)
+def chain_dataloader(h5_file, num_frames, max_hop_length, frameskip, batch_size, preprocessor, num_workers=0, pin_memory=False, distributed=False):
+    dataset = ChainDataset(h5_file, num_frames, max_hop_length, frameskip)
     collate_fn = partial(chain_collate_fn, preprocessor=preprocessor)
 
     train_size = int(0.8 * len(dataset))
@@ -189,6 +205,7 @@ lr = conf.lr
 batch_size = conf.batch_size
 num_frames = conf.num_frames
 max_hop_length = conf.max_hop_length
+frameskip = conf.frameskip
 num_workers = conf.num_workers
 log_to_wandb = conf.log_to_wandb
 datapath = conf.datapath
@@ -331,6 +348,7 @@ def train():
         conf.datapath,
         num_frames=num_frames,
         max_hop_length=max_hop_length,
+        frameskip=frameskip,
         batch_size=batch_size,
         preprocessor=pixel_preprocessor,
         num_workers=num_workers,
@@ -340,7 +358,9 @@ def train():
 
     # -- Model definition --
     action_encoder = Transpressor(
-        input_dim=conf.transpressor.input_dim,
+        # conf.transpressor.input_dim is the raw per-timestep action dim; each macro-step
+        # bundles frameskip of them concatenated, so the encoder's real input is frameskip times wider.
+        input_dim=frameskip * conf.transpressor.input_dim,
         hidden_dim=conf.transpressor.hidden_dim,
         condition_dim=conf.transpressor.condition_dim,
         depth=conf.transpressor.depth,
