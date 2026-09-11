@@ -287,7 +287,7 @@ def chain_forward(model, batch, weights, stage="train"):
     return {
         "loss": loss,
         "hop_mse_loss": hop_mse_loss,
-        "chain_mse_loss": chain_mse_loss,
+        "chain_cosine_loss": chain_cosine_loss,
         "action_sigreg_loss": action_sigreg_loss,
         "obs_sigreg_loss": obs_sigreg_loss,
     }
@@ -435,7 +435,7 @@ def train():
                 run.log({
                     "train/loss": loss.item(),
                     "train/hop_mse_loss": preds["hop_mse_loss"].item(),
-                    "train/chain_mse_loss": preds["chain_mse_loss"].item(),
+                    "train/chain_cosine_loss": preds["chain_cosine_loss"].item(),
                     "train/action_sigreg_loss": preds["action_sigreg_loss"].item(),
                     "train/obs_sigreg_loss": preds["obs_sigreg_loss"].item(),
                 }, step=global_step)
