@@ -16,3 +16,9 @@ data/
 wandb/
 checkpoints/
 old_checkpoints/
+
+# Mac stuff
+.DS_Store
+
+# Movies/outputs
+outputs/

@@ -461,105 +461,73 @@ class JEPA(nn.Module):
     ## Inference only ##
     ####################
 
-    def rollout(self, pixels, action_sequence, history_size: int = 3):
-        """Rollout the model given an initial info dict and action sequence.
-        pixels: (B, S, T, C, H, W)
-        action_sequence: (B, S, T, action_dim)
-         - S is the number of action plan samples
-         - T is the time horizon
+    def rollout(self, pixels, latent_actions, real_hop_input=None, real_hop_lengths=None, history_size=None):
+        """Imagine a trajectory forward from real observed history using CEM-sampled latent actions.
+        pixels: (B, T_hist, C, H, W) - the real observed history. Identical across every one
+            of the S candidates, so it's encoded once here rather than pre-broadcast across S.
+        latent_actions: (B, S, T_plan, D_cond) - per-candidate action embeddings sampled
+            directly from N(0, I) by CEM; fed straight to the predictor, bypassing the action
+            encoder entirely (the action encoder's sigreg training term is what makes raw
+            Gaussian draws valid inputs here).
+        real_hop_input: (B*(T_hist-1), max_len, action_dim), optional - the real hops
+            connecting the history frames. Omit when T_hist == 1 (no action history yet).
+        real_hop_lengths: (B*(T_hist-1),), optional - each real hop's true length.
+        history_size: int, optional - max context length kept for the predictor at each
+            step (defaults to keeping the whole growing history).
+        Returns: (B, S, D) - the predicted embedding after the full T_plan-step plan.
         """
+        B, T_hist = pixels.shape[:2]
+        S, T_plan, D_cond = latent_actions.shape[1:]
 
-        H = info["pixels"].size(2)
-        b_orig, s_orig, t_orig, a_orig = action_sequence.shape
-        
-        B, S, T, A = action_sequence.shape
-        
-        device = action_sequence.device
-        action_sequence = action_sequence.view(B, S, T, -1, 2)
-        B, S, T, D, A = action_sequence.shape
-        
-        start_padding = torch.full((B, S, T, 1, A), -2.0, device=device)
-        end_padding = torch.full((B, S, T, 1, A), -3.0, device=device)
-        action_sequence = torch.cat([start_padding, action_sequence, end_padding], dim=3)
-                
-        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
-        info["action"] = act_0
-        n_steps = T - H
+        # encode the real history once - it's identical across all S candidates
+        obs = self.encode_pixels(pixels)  # (B, T_hist, D)
+        if T_hist > 1:
+            hop_emb = self.encode_actions(real_hop_input, real_hop_lengths)  # (B*(T_hist-1), 1, D_cond)
+            hop_emb = hop_emb.squeeze(1).unflatten(0, (B, T_hist - 1))  # (B, T_hist-1, D_cond)
+        else:
+            hop_emb = obs.new_zeros(B, 0, D_cond)
 
-        # copy and encode initial info dict
-        _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
-        _init["action"] = _init["action"].flatten(0, 1)
-        _init = self.encode(_init)
-        emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
-        _init = {k: detach_clone(v) for k, v in _init.items()}
+        # broadcast the real history across S candidates, then flatten (B, S) -> BS
+        obs = obs.unsqueeze(1).expand(B, S, T_hist, -1).reshape(B * S, T_hist, -1)
+        hop_emb = hop_emb.unsqueeze(1).expand(B, S, T_hist - 1, D_cond).reshape(B * S, T_hist - 1, D_cond)
+        latent_actions = latent_actions.flatten(0, 1)  # (BS, T_plan, D_cond)
 
-        # flatten batch and sample dimensions for rollout
-        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
-        act = rearrange(act_0, "b s ... -> (b s) ...")
-        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+        for t in range(T_plan):
+            hop_emb = torch.cat([hop_emb, latent_actions[:, t : t + 1]], dim=1)  # (BS, len+1, D_cond)
+            ctx_obs = obs if history_size is None else obs[:, -history_size:]
+            ctx_hop = hop_emb if history_size is None else hop_emb[:, -history_size:]
+            pred = self.predictor(ctx_obs, ctx_hop)[:, -1:]  # (BS, 1, D)
+            obs = torch.cat([obs, pred], dim=1)
 
-        # rollout predictor autoregressively for n_steps
-        HS = history_size
-        for t in range(n_steps):
-            B, S, T, D = act.shape
-            act = act.flatten(0, 1)
-            act_emb, _ = self.action_encoder.encode(act)
-            act = act.unflatten(0, (B, S))
-            act_emb = act_emb.squeeze(1).unflatten(0, (B, S))
-            emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-            act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
-            # act_trunc = act_emb
-            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
-            emb = torch.cat([emb, pred_emb], dim=1)  # (BS, T+1, D)
-
-            next_act = act_future[:, t : t + 1, :]  # (BS, 1, action_dim)
-            act = torch.cat([act, next_act], dim=1)  # (BS, T+1, action_dim)
-
-        # predict the last state
-        act_b, act_s, _, _ = act.shape
-        act = act.flatten(0, 1)
-        act_emb, _ = self.action_encoder.encode(act)  # (BS, T, A_emb)
-        act = act.unflatten(0, (act_b, act_s))
-        act_emb = act_emb.squeeze(1).unflatten(0, (act_b, act_s))
-        
-        emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-        act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
-        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
-        emb = torch.cat([emb, pred_emb], dim=1)
-        B, S, D = emb.shape
-        
-        # unflatten batch and sample dimensions
-        pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=b_orig, s=s_orig)
-        info["predicted_emb"] = pred_rollout
-
-        return info
+        return obs[:, -1].unflatten(0, (B, S))  # (B, S, D)
 
     def criterion(self, predicted_emb, goal_emb):
-        """Compute the cost between predicted embeddings and goal embeddings.
-        predicted_emb: (B, S, T-1, dim)
-        goal_emb: (B, S, T, dim)
+        """Compute the MSE cost between predicted and goal embeddings.
+        predicted_emb: (B, S, dim) - predicted next-observation embedding per candidate.
+        goal_emb: (B, dim) - target goal embedding.
         """
-        pred_emb = predicted_emb  # (B,S, T-1, dim)
-        goal_emb = goal_emb  # (B, S, T, dim)
+        goal_emb = goal_emb.unsqueeze(1).expand_as(predicted_emb)  # (B, S, dim)
 
-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
-
-        # return last-step cost per action candidate
         cost = F.mse_loss(
-            pred_emb[..., -1:, :],
-            goal_emb[..., -1:, :].detach(),
+            predicted_emb,
+            goal_emb.detach(),
             reduction="none",
-        ).sum(dim=tuple(range(2, pred_emb.ndim)))  # (B, S)
+        ).sum(dim=-1)  # (B, S)
 
         return cost
 
-    def get_cost(self, initial_state, goal, action_candidates: torch.Tensor):
-        """ Compute the cost of action candidates given a goal and initial state."""
-        initial_state = self.encode(initial_state)
-        goal = self.encode(goal)
+    def get_cost(self, pixels, goal, latent_actions, real_hop_input=None, real_hop_lengths=None, history_size=None):
+        """Compute the cost of CEM-sampled latent action plans given a goal and real history.
+        pixels: (B, T_hist, C, H, W) - the real observed history.
+        goal: (B, C, H, W) - the target observation.
+        latent_actions: (B, S, T_plan, D_cond) - CEM-sampled per-candidate action embeddings.
+        real_hop_input / real_hop_lengths: see rollout() - the real hops behind `pixels`.
+        """
+        predicted_emb = self.rollout(
+            pixels, latent_actions, real_hop_input, real_hop_lengths, history_size
+        )  # (B, S, D)
+        goal_emb = self.encode_pixels(goal.unsqueeze(1)).squeeze(1)  # (B, D)
 
-        predicted_emb = self.rollout(initial_state, action_candidates)
+        cost = self.criterion(predicted_emb, goal_emb)
 
-        cost = self.criterion(predicted_emb, goal)
-        
         return cost
