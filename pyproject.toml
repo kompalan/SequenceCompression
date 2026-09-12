@@ -1,5 +1,5 @@
 [project]
-name = "transpressor"
+name = "sequence_compression"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -8,15 +8,18 @@ dependencies = [
     "datasets>=5.0.1",
     "einops>=0.8.2",
     "evotorch>=0.6.1",
-    "gym-pusht>=0.1.6",
     "h5py>=3.16.0",
     "hdf5plugin>=7.0.0",
     "imageio>=2.37.4",
     "imageio-ffmpeg>=0.6.0",
     "ipywidgets>=8.1.9",
     "omegaconf>=2.3.1",
+    "opencv-python-headless>=4.0.0",
     "pillow>=12.3.0",
-    "pymunk<7",
+    "pygame>=2.6.1",
+    "pymunk>=7",
+    "shapely>=2.1.2",
+    "stable-worldmodel>=0.1.1",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
     "tqdm>=4.70.0",
@@ -25,8 +28,11 @@ dependencies = [
 ]
 
 [project.scripts]
-transpressor = "transpressor:main"
+train = "sequence_compression:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pyright]
+reportIndexIssue = "none"

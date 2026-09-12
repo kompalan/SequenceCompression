@@ -269,6 +269,8 @@ class TransformerDecoder(nn.Module):
 
         self.input_proj = (
             nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim else
+            nn.Identity()
         )
         
         self.pos_enc = (
@@ -390,7 +392,12 @@ class JEPA(nn.Module):
         super().__init__()
 
         self.pixel_encoder = pixel_encoder
-        self.pixel_projector = MLP(self.pixel_encoder.config.hidden_size, self.pixel_encoder.config.hidden_size*2)
+
+        # Choosing 80 here because of some analysis in `representation_analysis.ipynb`. It seems for my 
+        # data, the amount of informative eigenvectors is roughly 80. The idea here is to apply a learned 
+        # projection from R^385 to R^80, which we would then feed into the encoder
+        self.subspace_size = 80
+        self.pixel_projector = nn.Linear(self.pixel_encoder.config.hidden_size, self.subspace_size, bias=False)
 
         self.action_encoder = action_encoder
         self.predictor = predictor
@@ -508,36 +515,21 @@ class JEPA(nn.Module):
         """
         # goal_emb = goal_emb.unsqueeze(1).expand_as(predicted_emb)  # (B, S, dim)
 
-        cost = F.mse_loss(
-            predicted_emb,
-            goal_emb.detach(),
-            reduction="none",
-        ).sum(dim=-1)  # (B, S)
-
-        # cost = 1 - F.cosine_similarity(
+        # cost = F.mse_loss(
         #     predicted_emb,
         #     goal_emb.detach(),
-        #     dim=-1,
-        # )  # (B, S)
+        #     reduction="none",
+        # ).sum(dim=-1)  # (B, S)
+
+        cost = 1 - F.cosine_similarity(
+            predicted_emb,
+            goal_emb.detach(),
+            dim=-1,
+        )  # (B, S)
 
         return cost
 
-    # def get_cost(self, pixels, goal, latent_actions, real_hop_input=None, real_hop_lengths=None, history_size=None):
-    #     """Compute the cost of CEM-sampled latent action plans given a goal and real history.
-    #     pixels: (B, T_hist, C, H, W) - the real observed history.
-    #     goal: (B, C, H, W) - the target observation.
-    #     latent_actions: (B, S, T_plan, D_cond) - CEM-sampled per-candidate action embeddings.
-    #     real_hop_input / real_hop_lengths: see rollout() - the real hops behind `pixels`.
-    #     """
-    #     predicted_emb = self.rollout(
-    #         pixels, latent_actions, real_hop_input, real_hop_lengths, history_size
-    #     )  # (B, S, D)
-    #     goal_emb = self.encode_pixels(goal.unsqueeze(1)).squeeze(1)  # (B, D)
-
-    #     cost = self.criterion(predicted_emb, goal_emb)
-
-    #     return cost
-
+  
     def criterion(self, info_dict: dict, action_candidates: torch.Tensor):
         return self.get_cost(info_dict, action_candidates)
 
@@ -549,8 +541,6 @@ class JEPA(nn.Module):
         pixels = info_dict["pixels"]  # (B, T_hist, C, H, W)
         goal = info_dict["goal"]  # (B, C, H, W)
 
-        
-
         if len(pixels.shape) > 5:
             B, S, _, _, C, H, W = pixels.shape
             pixels = pixels.reshape(B*S, 1, C, H, W)
@@ -558,11 +548,7 @@ class JEPA(nn.Module):
         else:
             B, S, C, H, W = pixels.shape
 
-        # print(pixels[0].shape)
-        # print(action_candidates.shape)
-        # print(goal[0].shape)
-
-        macro_steps = action_candidates.reshape(B * S, 1, action_candidates.shape[-1])
+        macro_steps = action_candidates.reshape(B * S, -1, action_candidates.shape[-1])
         start = torch.full((B * S, 1, action_candidates.shape[-1]), -2, device=action_candidates.device, dtype=macro_steps.dtype)
         end = torch.full((B * S, 1, action_candidates.shape[-1]), -3, device=action_candidates.device, dtype=macro_steps.dtype)
         hop_input = torch.cat([start, macro_steps, end], dim=1)  # (BS, horizon+1, action_dim)
@@ -580,11 +566,6 @@ class JEPA(nn.Module):
         predicted_emb = predicted_emb.reshape(B, S, -1)
         goal_emb = goal_emb.tile((1, 300, 1))
 
-
-        # print(goal_emb.shape)
-        # print(predicted_emb.shape)
-
         cost = self.cost(predicted_emb, goal_emb)
 
-        # print(cost)
         return cost

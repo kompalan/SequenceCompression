@@ -24,8 +24,8 @@ from transformers import AutoImageProcessor, AutoModel
 # Actions are normalized to mean 0 / unit variance in ChainDataset (raw action std is ~0.2,
 # so the normalized range is ~5x wider than raw), so these sentinels sit further out than the
 # pre-normalization -2.0/-3.0 to stay outside the normalized action range.
-START_VALUE = -15.0
-END_VALUE = -20.0
+START_VALUE = -2
+END_VALUE = -3
 
 class ChainDataset(Dataset):
     """A chain of num_frames observations connected by num_frames-1 variable-length action hops.
@@ -52,14 +52,14 @@ class ChainDataset(Dataset):
         with h5py.File(h5_file, "r") as f:
             ep_offset = f["ep_offset"][:]
             ep_len = f["ep_len"][:]
-            raw_actions = torch.tensor(f["action"][:], dtype=torch.float32)
+            # raw_actions = torch.tensor(f["action"][:], dtype=torch.float32)
 
         # Per-dimension mean/std over every raw action in the file, used to normalize actions
         # to mean 0 / unit variance in __getitem__. Computed once here (not per-hop) so every
         # split drawn from this dataset (see random_split in chain_dataloader) shares the same
         # statistics rather than each seeing its own.
-        self.action_mean = raw_actions.mean(dim=0)
-        self.action_std = raw_actions.std(dim=0).clamp_min(1e-6)
+        # self.action_mean = raw_actions.mean(dim=0)
+        # self.action_std = raw_actions.std(dim=0).clamp_min(1e-6)
 
         # Every hop needs at least one macro-step, i.e. at least `frameskip` raw actions, so a
         # chain of num_frames-1 hops needs at least (num_frames-1)*frameskip raw actions of room.
@@ -113,7 +113,7 @@ class ChainDataset(Dataset):
             i_t += length * self.frameskip
             frame_indices.append(i_t)
 
-        pixels = torch.tensor(self._h5["pixels"][frame_indices], dtype=torch.float32)  # type: ignore
+        pixels = torch.tensor(self._h5["pixels"][frame_indices], dtype=torch.float32)
 
         hop_inputs = []
         hop_targets = []
@@ -121,9 +121,9 @@ class ChainDataset(Dataset):
         i_t = i1
         for length in hop_lengths_raw:
             raw_actions = torch.tensor(
-                self._h5["action"][i_t:i_t + length * self.frameskip], dtype=torch.float32  # type: ignore
+                self._h5["action"][i_t:i_t + length * self.frameskip], dtype=torch.float32 
             )  # (length*frameskip, action_dim)
-            raw_actions = (raw_actions - self.action_mean) / self.action_std
+            # raw_actions = (raw_actions - self.action_mean) / self.action_std
             # Chunk every frameskip consecutive raw actions into one macro-step, concatenated
             # along the feature axis: (length*frameskip, action_dim) -> (length, frameskip*action_dim).
             actions = raw_actions.reshape(length, -1)
@@ -209,7 +209,8 @@ def chain_dataloader(h5_file, num_frames, max_hop_length, frameskip, batch_size,
     return train, test, train_sampler
 
 # -- Setup --
-conf = OmegaConf.load("config/transpressor.yaml")
+wd = os.path.dirname(os.path.abspath(__file__))
+conf = OmegaConf.load("config/transpressor_v3.yaml")
 torch.autograd.set_detect_anomaly(True)
 
 n_epochs = conf.n_epochs
@@ -284,6 +285,10 @@ def chain_forward(model, batch, weights, stage="train"):
 
     # chain_mse_loss = F.mse_loss(out["pred"], out["target"])
     chain_cosine_loss = 1 - F.cosine_similarity(out["pred"], out["target"], dim=-1).mean()
+    chain_mse_loss = F.mse_loss(out["pred"], out["target"], reduction="mean")
+
+    # Add a small MSE penalty to prevent the magnitude from deviating too far
+    chain_prediction_loss = chain_cosine_loss + 0.1 * chain_mse_loss
 
     # (T-1, B, D_cond) / (T, B, D): groups by chain position, giving genuine B-sample groups.
     action_sigreg_loss = sigreg_term(out["hop_emb"].transpose(0, 1))
@@ -291,9 +296,9 @@ def chain_forward(model, batch, weights, stage="train"):
 
     loss = (
         weights.hop_mse * hop_mse_loss
-        + weights.chain_cosine * chain_cosine_loss
+        + weights.chain_prediction * chain_prediction_loss
         + weights.action_sigreg * action_sigreg_loss
-        + weights.obs_sigreg * obs_sigreg_loss
+        # + weights.obs_sigreg * obs_sigreg_loss
     )
 
     return {
@@ -301,7 +306,7 @@ def chain_forward(model, batch, weights, stage="train"):
         "hop_mse_loss": hop_mse_loss,
         "chain_cosine_loss": chain_cosine_loss,
         "action_sigreg_loss": action_sigreg_loss,
-        "obs_sigreg_loss": obs_sigreg_loss,
+        # "obs_sigreg_loss": obs_sigreg_loss,
     }
 
 def nan_hook(module, inp, out):
@@ -389,7 +394,7 @@ def train():
         # x for the chain predictor is the pixel encoder's own CLS-pooled embedding, so its
         # feature dim must track the pixel encoder's hidden size, not conf.ar_predictor.input_dim
         # (which is the action dim and unrelated to this path).
-        input_dim=pixel_encoder.config.hidden_size,
+        input_dim=conf.ar_predictor.input_dim,
         hidden_dim=conf.ar_predictor.hidden_dim,
         condition_dim=conf.ar_predictor.condition_dim,
         depth=conf.ar_predictor.depth,
