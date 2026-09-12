@@ -501,12 +501,12 @@ class JEPA(nn.Module):
 
         return obs[:, -1].unflatten(0, (B, S))  # (B, S, D)
 
-    def criterion(self, predicted_emb, goal_emb):
+    def cost(self, predicted_emb, goal_emb):
         """Compute the MSE cost between predicted and goal embeddings.
         predicted_emb: (B, S, dim) - predicted next-observation embedding per candidate.
         goal_emb: (B, dim) - target goal embedding.
         """
-        goal_emb = goal_emb.unsqueeze(1).expand_as(predicted_emb)  # (B, S, dim)
+        # goal_emb = goal_emb.unsqueeze(1).expand_as(predicted_emb)  # (B, S, dim)
 
         cost = F.mse_loss(
             predicted_emb,
@@ -514,20 +514,77 @@ class JEPA(nn.Module):
             reduction="none",
         ).sum(dim=-1)  # (B, S)
 
+        # cost = 1 - F.cosine_similarity(
+        #     predicted_emb,
+        #     goal_emb.detach(),
+        #     dim=-1,
+        # )  # (B, S)
+
         return cost
 
-    def get_cost(self, pixels, goal, latent_actions, real_hop_input=None, real_hop_lengths=None, history_size=None):
+    # def get_cost(self, pixels, goal, latent_actions, real_hop_input=None, real_hop_lengths=None, history_size=None):
+    #     """Compute the cost of CEM-sampled latent action plans given a goal and real history.
+    #     pixels: (B, T_hist, C, H, W) - the real observed history.
+    #     goal: (B, C, H, W) - the target observation.
+    #     latent_actions: (B, S, T_plan, D_cond) - CEM-sampled per-candidate action embeddings.
+    #     real_hop_input / real_hop_lengths: see rollout() - the real hops behind `pixels`.
+    #     """
+    #     predicted_emb = self.rollout(
+    #         pixels, latent_actions, real_hop_input, real_hop_lengths, history_size
+    #     )  # (B, S, D)
+    #     goal_emb = self.encode_pixels(goal.unsqueeze(1)).squeeze(1)  # (B, D)
+
+    #     cost = self.criterion(predicted_emb, goal_emb)
+
+    #     return cost
+
+    def criterion(self, info_dict: dict, action_candidates: torch.Tensor):
+        return self.get_cost(info_dict, action_candidates)
+
+    def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
         """Compute the cost of CEM-sampled latent action plans given a goal and real history.
-        pixels: (B, T_hist, C, H, W) - the real observed history.
-        goal: (B, C, H, W) - the target observation.
-        latent_actions: (B, S, T_plan, D_cond) - CEM-sampled per-candidate action embeddings.
-        real_hop_input / real_hop_lengths: see rollout() - the real hops behind `pixels`.
+        info: dict - contains the real observed history and goal.
+        action_candidates: (B, S, T_plan, D_cond) - CEM-sampled per-candidate action embeddings.
         """
+        pixels = info_dict["pixels"]  # (B, T_hist, C, H, W)
+        goal = info_dict["goal"]  # (B, C, H, W)
+
+        
+
+        if len(pixels.shape) > 5:
+            B, S, _, _, C, H, W = pixels.shape
+            pixels = pixels.reshape(B*S, 1, C, H, W)
+            goal = goal.reshape(B*S, 1, C, H, W)
+        else:
+            B, S, C, H, W = pixels.shape
+
+        # print(pixels[0].shape)
+        # print(action_candidates.shape)
+        # print(goal[0].shape)
+
+        macro_steps = action_candidates.reshape(B * S, 1, action_candidates.shape[-1])
+        start = torch.full((B * S, 1, action_candidates.shape[-1]), -2, device=action_candidates.device, dtype=macro_steps.dtype)
+        end = torch.full((B * S, 1, action_candidates.shape[-1]), -3, device=action_candidates.device, dtype=macro_steps.dtype)
+        hop_input = torch.cat([start, macro_steps, end], dim=1)  # (BS, horizon+1, action_dim)
+        hop_length = torch.full((B * S,), 1 + 1, device=action_candidates.device, dtype=torch.long)
+        action_embs = self.encode_actions(hop_input, hop_length)  # (BS, 1, D_cond)
+        action_embs = action_embs.reshape(B, S, 1, -1)
+
         predicted_emb = self.rollout(
-            pixels, latent_actions, real_hop_input, real_hop_lengths, history_size
+            pixels[0].unsqueeze(0), action_embs
         )  # (B, S, D)
-        goal_emb = self.encode_pixels(goal.unsqueeze(1)).squeeze(1)  # (B, D)
 
-        cost = self.criterion(predicted_emb, goal_emb)
+  
+        goal_emb = self.encode_pixels(goal[0].unsqueeze(0)) # (B, D)
 
+        predicted_emb = predicted_emb.reshape(B, S, -1)
+        goal_emb = goal_emb.tile((1, 300, 1))
+
+
+        # print(goal_emb.shape)
+        # print(predicted_emb.shape)
+
+        cost = self.cost(predicted_emb, goal_emb)
+
+        # print(cost)
         return cost

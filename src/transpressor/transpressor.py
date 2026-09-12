@@ -21,8 +21,11 @@ from omegaconf import OmegaConf
 
 from transformers import AutoImageProcessor, AutoModel
 
-START_VALUE = -2.0
-END_VALUE = -3.0
+# Actions are normalized to mean 0 / unit variance in ChainDataset (raw action std is ~0.2,
+# so the normalized range is ~5x wider than raw), so these sentinels sit further out than the
+# pre-normalization -2.0/-3.0 to stay outside the normalized action range.
+START_VALUE = -15.0
+END_VALUE = -20.0
 
 class ChainDataset(Dataset):
     """A chain of num_frames observations connected by num_frames-1 variable-length action hops.
@@ -49,13 +52,21 @@ class ChainDataset(Dataset):
         with h5py.File(h5_file, "r") as f:
             ep_offset = f["ep_offset"][:]
             ep_len = f["ep_len"][:]
+            raw_actions = torch.tensor(f["action"][:], dtype=torch.float32)
+
+        # Per-dimension mean/std over every raw action in the file, used to normalize actions
+        # to mean 0 / unit variance in __getitem__. Computed once here (not per-hop) so every
+        # split drawn from this dataset (see random_split in chain_dataloader) shares the same
+        # statistics rather than each seeing its own.
+        self.action_mean = raw_actions.mean(dim=0)
+        self.action_std = raw_actions.std(dim=0).clamp_min(1e-6)
 
         # Every hop needs at least one macro-step, i.e. at least `frameskip` raw actions, so a
         # chain of num_frames-1 hops needs at least (num_frames-1)*frameskip raw actions of room.
         min_raw_span = (self.num_frames - 1) * self.frameskip
         starts = []
         ends = []
-        for offset, length in zip(ep_offset, ep_len):
+        for offset, length in zip(ep_offset, ep_len): # type: ignore
             offset = int(offset)
             length = int(length)
             if length >= min_raw_span + 1:
@@ -112,6 +123,7 @@ class ChainDataset(Dataset):
             raw_actions = torch.tensor(
                 self._h5["action"][i_t:i_t + length * self.frameskip], dtype=torch.float32  # type: ignore
             )  # (length*frameskip, action_dim)
+            raw_actions = (raw_actions - self.action_mean) / self.action_std
             # Chunk every frameskip consecutive raw actions into one macro-step, concatenated
             # along the feature axis: (length*frameskip, action_dim) -> (length, frameskip*action_dim).
             actions = raw_actions.reshape(length, -1)
