@@ -31,7 +31,7 @@ transitions. This teaches the model not only how one action changes an
 observation, but how a *chain* of actions composes into a single transformation.
 
 This gives two payoffs:
-- **More data:** each $M$-step episode expands into its $2^M$ possible subsequences.
+- **More data:** each $M$-step episode expands into its $M^2$ possible subsequences.
 - **Hierarchical planning:** the model learns latent "actions" spanning arbitrary 
   numbers of timesteps — a vocabulary for long-horizon planning.
 
@@ -52,15 +52,10 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 *Note: not my figure. Credit to Lucas Maes et. al
 ## Training
 
-Run the training module from the repository root to use the configured device. With
-`device: "mps"`, use a single process on Apple Silicon:
-
-```bash
-uv run python -m transpressor.transpressor
+The training script is located in `src/sequence_compression/` under `train.py`. To kick off training, simply run:
 ```
-
-The distributed `torchrun` path is CPU-only. W&B logging and checkpoint writes are performed by rank 0 when distributed training is enabled.
-
+uv run train
+```
 
 ## Results
 
