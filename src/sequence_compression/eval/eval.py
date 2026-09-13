@@ -12,23 +12,25 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 import stable_worldmodel as swm
 from transformers import AutoModel, AutoImageProcessor
-from sequence_compression.module import JEPA, Transpressor, ARPredictor
+from sequence_compression.module import JEPA, Transpressor, ARPredictor, NaiveActionEmbedder
 
 def build_model_pipeline(config, checkpoint, device):
-    pixel_encoder = AutoModel.from_pretrained(config.pixel_encoder.model_name)
+    pixel_encoder = AutoModel.from_config(config.pixel_encoder.model_name)
     image_processor = AutoImageProcessor.from_pretrained(config.pixel_encoder.model_name)
 
-    action_encoder = Transpressor(
-        input_dim=config.frameskip * config.transpressor.input_dim,
-        hidden_dim=config.transpressor.hidden_dim,
-        condition_dim=config.transpressor.condition_dim,
-        depth=config.transpressor.depth,
-        heads=config.transpressor.heads,
-        dim_head=config.transpressor.dim_head,
-        mlp_dim=config.transpressor.mlp_dim,
-        sequence_dim=config.max_hop_length + 1,
-        output_proj=config.transpressor.output_proj,
-    )
+    # action_encoder = Transpressor(
+    #     input_dim=config.frameskip * config.transpressor.input_dim,
+    #     hidden_dim=config.transpressor.hidden_dim,
+    #     condition_dim=config.transpressor.condition_dim,
+    #     depth=config.transpressor.depth,
+    #     heads=config.transpressor.heads,
+    #     dim_head=config.transpressor.dim_head,
+    #     mlp_dim=config.transpressor.mlp_dim,
+    #     sequence_dim=config.max_hop_length + 1,
+    #     output_proj=config.transpressor.output_proj,
+    # )
+
+    action_encoder = NaiveActionEmbedder()
 
     predictor = ARPredictor(
         input_dim=pixel_encoder.config.hidden_size,
@@ -44,6 +46,7 @@ def build_model_pipeline(config, checkpoint, device):
     )
 
     model = JEPA(pixel_encoder=pixel_encoder, action_encoder=action_encoder, predictor=predictor)
+
     state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
     return model.to(device).eval(), image_processor
@@ -65,11 +68,13 @@ def image_transform(image_processor):
     return transform
 
 def run(cfg):
+    num_envs = 5
+
     # Create the PushT environment
-    world = swm.World("swm/PushT-v1", image_shape=(224, 224), num_envs=1)
+    world = swm.World("swm/PushT-v1", image_shape=(224, 224), num_envs=num_envs)
 
     # -- run evaluation
-    model, image_processor = build_model_pipeline(cfg, "../../checkpoints/lewm_epoch_1.pt", device=cfg.device)
+    model, image_processor = build_model_pipeline(cfg, "checkpoints/lewm_epoch_2.pt", device=cfg.device)
 
     config = swm.PlanConfig(horizon=1, receding_horizon=1, history_len=5, action_block=cfg.frameskip)
 
@@ -89,7 +94,7 @@ def run(cfg):
     )
 
     dataset = swm.data.HDF5Dataset(
-        path="../../data/pusht_expert_train.h5",
+        path="data/pusht_expert_train.h5",
         frameskip=cfg.frameskip,
         # "action" is stored per-step (dim 2) but frameskip>1 reshapes it into
         # frameskip*2-wide blocks, which then collides with and overwrites the
@@ -99,7 +104,9 @@ def run(cfg):
         keys_to_load=["episode_idx", "pixels", "proprio", "state", "step_idx"],
     )
 
-    results_path = Path(__file__).parent / "results"
+    starts = torch.randint(0, 18685, (num_envs,))
+
+    results_path = Path("results")
 
     world.set_policy(policy)
 
@@ -108,10 +115,10 @@ def run(cfg):
     start_time = time.time()
     metrics = world.evaluate(
         dataset=dataset,
-        start_steps=[0],
+        start_steps=torch.zeros_like(starts).tolist(),
         goal_offset=5,
         eval_budget=100,
-        episodes_idx=[0],
+        episodes_idx=starts.tolist(),
         video=results_path,
     )
     end_time = time.time()
@@ -132,8 +139,10 @@ def run(cfg):
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
-
-if __name__ == "__main__":
-    conf_path = "../../config/transpressor_v2.yaml"
+def eval():
+    conf_path = "config/transpressor_v2.yaml"
     config = OmegaConf.load(conf_path)
     run(config)
+
+if __name__ == "__main__":
+    eval()

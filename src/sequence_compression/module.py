@@ -61,11 +61,11 @@ class MLP(nn.Module):
         input_dim,
         hidden_dim,
         output_dim=None,
-        norm_fn=nn.LayerNorm,
+        norm_fn: type[nn.LayerNorm | nn.BatchNorm1d]=nn.LayerNorm,
         act_fn=nn.GELU,
     ):
         super().__init__()
-        norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity() # type: ignore
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             norm_fn,
@@ -336,13 +336,57 @@ class ARPredictor(nn.Module):
             out_proj=False,
     ):
         super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
         self.transformer = TransformerDecoder(
             input_dim, hidden_dim, condition_dim, depth, heads, dim_head, mlp_dim,
             dropout=dropout, sequence_dim=sequence_dim, out_proj=out_proj
         )
 
+    def get_input_dim(self) -> int:
+        return self.input_dim
+
     def forward(self, x, c=None):
         return self.transformer(x, c)
+
+class NaiveActionEmbedder(nn.Module):
+    def __init__(
+        self,
+        input_dim=10,
+        smoothed_dim=10,
+        emb_dim=10,
+        mlp_scale=4,
+    ):
+        super().__init__()
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
+
+    def encode(self, x, lengths=None):
+        """
+        x: (B, T, D)
+        """
+        x = x.float()
+        x = x.permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        x = self.embed(x)
+        return x
+
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        """
+        x = x.float()
+        x = x.permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        x = self.embed(x)
+        return x
 
 class Transpressor(nn.Module):
     def __init__(
@@ -397,15 +441,20 @@ class JEPA(nn.Module):
         # data, the amount of informative eigenvectors is roughly 80. The idea here is to apply a learned 
         # projection from R^385 to R^80, which we would then feed into the encoder
         self.subspace_size = 80
-        self.pixel_projector = nn.Linear(self.pixel_encoder.config.hidden_size, self.subspace_size, bias=False)
+        self.pixel_projector = MLP(
+            self.pixel_encoder.config.hidden_size, 
+            self.pixel_encoder.config.hidden_size*2,
+            norm_fn=nn.BatchNorm1d
+        )
 
         self.action_encoder = action_encoder
-        self.predictor = predictor
+        self.predictor: ARPredictor = predictor
 
-        # The pixel encoder is a frozen, pretrained backbone - never updated by the optimizer.
-        for param in self.pixel_encoder.parameters():
-            param.requires_grad = False
-        self.pixel_encoder.eval()
+        self.predictor_projector = MLP(
+            self.predictor.get_input_dim(),
+            self.predictor.get_input_dim()*2,
+            norm_fn=nn.BatchNorm1d
+        )
 
     def train(self, mode=True):
         super().train(mode)
@@ -420,13 +469,17 @@ class JEPA(nn.Module):
         blocking the forward pass).
         Returns CLS-pooled, per-frame embeddings: (B, T, hidden_size).
         """
-        B, T, c, h, w = pixels.shape
-        images = pixels.reshape(B * T, c, h, w)
+        batch, timestep, h, w, c = pixels.shape
+
+        # Channel must be first
+        pixels = pixels.transpose(4, 2)
+
+        images = pixels.reshape(batch * timestep, c, h, w)
 
         encoded_pixels = self.pixel_encoder(pixel_values=images).last_hidden_state[:, 0, :]  # CLS token
         encoded_pixels = self.pixel_projector(encoded_pixels)
 
-        return encoded_pixels.reshape(B, T, -1)
+        return encoded_pixels.reshape(batch, timestep, -1)
 
     def encode_actions(self, actions, lengths=None):
         return self.action_encoder.encode(actions, lengths)
@@ -444,21 +497,23 @@ class JEPA(nn.Module):
 
         obs = self.encode_pixels(pixels)  # (B, T, D)
 
-        hop_emb_flat = self.encode_actions(hop_input, hop_lengths)  # (B*(T-1), 1, D_cond)
-        hop_emb = hop_emb_flat.squeeze(1).reshape(B, T - 1, -1)  # (B, T-1, D_cond)
+        hop_emb = self.encode_actions(hop_input, hop_lengths)  # (B*T, 1, D_cond)
+        hop_emb = hop_emb.squeeze(1).reshape(B, T, -1)
+        hop_emb = hop_emb[:, :-1]
 
         x, target = obs[:, :-1], obs[:, 1:]  # (B, T-1, D) each
         pred = self.predictor(x, hop_emb)  # per-position AdaLN: hop_emb[:,t] conditions x[:,t]
 
-        decoded_actions = self.decode_actions(hop_input, hop_emb_flat, hop_lengths)
+        B, T, D = pred.shape
+        pred = pred.reshape(B*T, D)
+        pred = self.pixel_projector(pred)
+        pred = pred.reshape(B, T, D)
 
         return {
             "obs": obs,
             "pred": pred,
             "target": target,
             "hop_emb": hop_emb,
-            "hop_emb_flat": hop_emb_flat,
-            "decoded_actions": decoded_actions,
         }
 
     def forward(self, pixels, hop_input, hop_lengths=None):
@@ -541,6 +596,7 @@ class JEPA(nn.Module):
         pixels = info_dict["pixels"]  # (B, T_hist, C, H, W)
         goal = info_dict["goal"]  # (B, C, H, W)
 
+        # For compatibility with stable_worldmodel
         if len(pixels.shape) > 5:
             B, S, _, _, C, H, W = pixels.shape
             pixels = pixels.reshape(B*S, 1, C, H, W)
@@ -548,12 +604,7 @@ class JEPA(nn.Module):
         else:
             B, S, C, H, W = pixels.shape
 
-        macro_steps = action_candidates.reshape(B * S, -1, action_candidates.shape[-1])
-        start = torch.full((B * S, 1, action_candidates.shape[-1]), -2, device=action_candidates.device, dtype=macro_steps.dtype)
-        end = torch.full((B * S, 1, action_candidates.shape[-1]), -3, device=action_candidates.device, dtype=macro_steps.dtype)
-        hop_input = torch.cat([start, macro_steps, end], dim=1)  # (BS, horizon+1, action_dim)
-        hop_length = torch.full((B * S,), 1 + 1, device=action_candidates.device, dtype=torch.long)
-        action_embs = self.encode_actions(hop_input, hop_length)  # (BS, 1, D_cond)
+        action_embs = self.encode_actions(action_candidates.flatten(0, 1))  # (BS, 1, D_cond)
         action_embs = action_embs.reshape(B, S, 1, -1)
 
         predicted_emb = self.rollout(
