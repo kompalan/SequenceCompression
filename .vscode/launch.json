@@ -8,7 +8,7 @@
             "name": "Python Debugger: transpressor.transpressor",
             "type": "debugpy",
             "request": "launch",
-            "module": "transpressor.transpressor",
+            "module": "sequence_compression.train",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {

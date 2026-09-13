@@ -6,7 +6,7 @@ import h5py
 import torch
 from omegaconf import OmegaConf
 
-from .module import Transpressor
+from ..module import Transpressor
 
 
 CHECKPOINT_PATTERN = re.compile(r"transpressor_epoch_(\d+)\.pt$")
@@ -84,10 +84,10 @@ def evaluate(model, h5_path, context_length, batch_size, device):
 
     with h5py.File(h5_path, "r") as data:
         actions = data["action"]
-        for offset, episode_length in zip(data["ep_offset"][:], data["ep_len"][:]):
+        for offset, episode_length in zip(data["ep_offset"][:], data["ep_len"][:]): # type: ignore
             offset = int(offset)
             episode_length = int(episode_length)
-            episode = torch.from_numpy(actions[offset : offset + episode_length])
+            episode = torch.from_numpy(actions[offset : offset + episode_length]) # type: ignore
 
             for start in range(0, episode_length, context_length):
                 length = min(context_length, episode_length - start)

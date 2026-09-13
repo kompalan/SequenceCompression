@@ -1,0 +1,47 @@
+n_epochs: 100
+lr: 1e-5
+batch_size: 200 # each chain item costs num_frames real DINOv2 forward passes - revisit once profiled
+num_frames: 10
+max_hop_length: 10
+frameskip: 5
+num_workers: 4
+log_to_wandb: False 
+
+loss_weights:
+  hop_mse: 1.0
+  chain_mse: 5.0
+  action_sigreg: 0.09
+  obs_sigreg: 0.09
+
+transpressor:
+  input_dim: 2
+  hidden_dim: 64
+  condition_dim: 64
+  depth: 6
+  heads: 16
+  dim_head: 64
+  mlp_dim: 2048
+  dropout: 0.1
+  output_proj: True
+
+ar_predictor:
+  hidden_dim: 64
+  condition_dim: 64
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+pixel_preprocessor:
+  model_name: "facebook/dinov2-small"
+
+pixel_encoder:
+  model_name: "facebook/dinov2-small"
+
+datapath: "data/pusht_expert_train.h5"
+
+device: "mps"
+
+world_size: 1
