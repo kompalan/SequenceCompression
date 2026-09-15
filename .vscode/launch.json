@@ -5,10 +5,22 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: transpressor.transpressor",
+            "name": "Python Debugger: train",
             "type": "debugpy",
             "request": "launch",
             "module": "sequence_compression.train",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+
+        {
+            "name": "Python Debugger: eval",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "sequence_compression.eval.eval",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {

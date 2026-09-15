@@ -11,29 +11,18 @@ import h5py
 import torch
 from omegaconf import DictConfig, OmegaConf
 import stable_worldmodel as swm
-from transformers import AutoModel, AutoImageProcessor
+from transformers import AutoModel, AutoImageProcessor, AutoConfig
 from sequence_compression.module import JEPA, Transpressor, ARPredictor, NaiveActionEmbedder
 
 def build_model_pipeline(config, checkpoint, device):
-    pixel_encoder = AutoModel.from_config(config.pixel_encoder.model_name)
-    image_processor = AutoImageProcessor.from_pretrained(config.pixel_encoder.model_name)
+    pixel_preprocessor = AutoImageProcessor.from_pretrained(config.pixel_preprocessor.model_name)
+    vitconfig = AutoConfig.from_pretrained(config.pixel_encoder.model_name)
+    pixel_encoder = AutoModel.from_config(vitconfig)
 
-    # action_encoder = Transpressor(
-    #     input_dim=config.frameskip * config.transpressor.input_dim,
-    #     hidden_dim=config.transpressor.hidden_dim,
-    #     condition_dim=config.transpressor.condition_dim,
-    #     depth=config.transpressor.depth,
-    #     heads=config.transpressor.heads,
-    #     dim_head=config.transpressor.dim_head,
-    #     mlp_dim=config.transpressor.mlp_dim,
-    #     sequence_dim=config.max_hop_length + 1,
-    #     output_proj=config.transpressor.output_proj,
-    # )
-
-    action_encoder = NaiveActionEmbedder()
+    action_encoder = NaiveActionEmbedder(emb_dim=config.naive_action_embedder.embed_dim).to(device)
 
     predictor = ARPredictor(
-        input_dim=pixel_encoder.config.hidden_size,
+        input_dim=config.ar_predictor.input_dim,
         hidden_dim=config.ar_predictor.hidden_dim,
         condition_dim=config.ar_predictor.condition_dim,
         depth=config.ar_predictor.depth,
@@ -43,13 +32,17 @@ def build_model_pipeline(config, checkpoint, device):
         dropout=config.ar_predictor.dropout,
         sequence_dim=config.num_frames - 1,
         out_proj=config.transpressor.output_proj,
-    )
+    ).to(device)
 
-    model = JEPA(pixel_encoder=pixel_encoder, action_encoder=action_encoder, predictor=predictor)
+    model = JEPA(
+        pixel_encoder=pixel_encoder,
+        action_encoder=action_encoder,
+        predictor=predictor
+    ).to(device=device)
 
     state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
-    return model.to(device).eval(), image_processor
+    return model.to(device).eval(), pixel_preprocessor
 
 def get_episodes_length(dataset, episodes):
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
@@ -63,6 +56,8 @@ def get_episodes_length(dataset, episodes):
 
 def image_transform(image_processor):
     def transform(image):
+        # image = image.transpose(0, 2)
+        # print(image.shape)
         return image_processor(image, return_tensors="pt")["pixel_values"]
 
     return transform
@@ -74,9 +69,9 @@ def run(cfg):
     world = swm.World("swm/PushT-v1", image_shape=(224, 224), num_envs=num_envs)
 
     # -- run evaluation
-    model, image_processor = build_model_pipeline(cfg, "checkpoints/lewm_epoch_2.pt", device=cfg.device)
+    model, image_processor = build_model_pipeline(cfg, "checkpoints/lewm_epoch_12.pt", device=cfg.device)
 
-    config = swm.PlanConfig(horizon=1, receding_horizon=1, history_len=5, action_block=cfg.frameskip)
+    config = swm.PlanConfig(horizon=1, receding_horizon=1, history_len=3, action_block=cfg.frameskip)
 
     solver = swm.solver.CEMSolver(
         model=model,
@@ -140,7 +135,7 @@ def run(cfg):
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
 def eval():
-    conf_path = "config/transpressor_v2.yaml"
+    conf_path = "config/transpressor_baseline.yaml"
     config = OmegaConf.load(conf_path)
     run(config)
 

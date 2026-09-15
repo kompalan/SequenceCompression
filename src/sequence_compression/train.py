@@ -1,7 +1,9 @@
 import os
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
+from torchvision.transforms.v2 import ToImage, ToDtype, Normalize, Resize, Compose
 import torch.nn.functional as F
 import hdf5plugin
 import h5py
@@ -13,13 +15,14 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, random_spl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
-from .module import JEPA, ARPredictor, NaiveActionEmbedder, SIGReg
+from .module import JEPA, ARPredictor, NaiveActionEmbedder, SIGReg, vit_hf
 
 import wandb
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from transformers import AutoImageProcessor, AutoModel, AutoConfig
+from huggingface_hub import HfApi
 
 # Actions are normalized to mean 0 / unit variance in ChainDataset (raw action std is ~0.2,
 # so the normalized range is ~5x wider than raw), so these sentinels sit further out than the
@@ -36,15 +39,14 @@ class ActionDataset(Dataset):
     on every __getitem__ call, so the same start index yields different hop lengths across epochs.
     """
 
-    def __init__(self, h5_file, num_frames, frameskip):
+    def __init__(self, h5_file, num_frames, frameskip, preprocessor):
         assert num_frames >= 2, "num_frames must be >= 2 (need at least one hop)"
-        assert max_hop_length >= 1, "max_hop_length must be >= 1"
         assert frameskip >= 1, "frameskip must be >= 1"
 
         self.h5_file = h5_file
         self.num_frames = num_frames
-        self.max_hop_length = max_hop_length
         self.frameskip = frameskip
+        self.preprocessor = preprocessor
         # h5py file handles aren't fork-safe, so don't keep the one used here around - each
         # DataLoader worker process opens its own lazily, on its first __getitem__ call.
         self._h5 = None
@@ -95,8 +97,13 @@ class ActionDataset(Dataset):
         # Read the whole contiguous span once and subsample in numpy, rather than indexing
         # h5py with a list - on this blosc-compressed, chunked dataset, list/fancy indexing
         # forces slow point-selection reads (~40x slower per item than a contiguous read).
-        pixels_block = self._h5["pixels"][i1:episode_end] # type: ignore
-        pixels = torch.tensor(pixels_block[::5], dtype=torch.float32)
+        pixels_block = torch.tensor(self._h5["pixels"][i1:episode_end][::self.frameskip]) # type: ignore
+
+        # ToImage() only permutes HWC -> CHW for raw numpy/PIL input; since pixels_block is
+        # already a torch.Tensor here, it would otherwise pass through unpermuted and break
+        # Normalize/Resize downstream (which expect channels-first).
+        pixels_block = pixels_block.permute(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
+        pixels = self.preprocessor(pixels_block) # (T, C, H, W)
 
         return {
             "pixels": pixels,
@@ -104,7 +111,7 @@ class ActionDataset(Dataset):
         }
 
 def action_dataloader(h5_file, num_frames, frameskip, batch_size, preprocessor, num_workers=0, pin_memory=False, distributed=False):
-    dataset = ActionDataset(h5_file, num_frames, frameskip)
+    dataset = ActionDataset(h5_file, num_frames, frameskip, preprocessor=preprocessor)
 
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
@@ -344,6 +351,22 @@ datapath = conf.datapath
 device = conf.device
 sigreg_term: SIGReg | None = None
 
+push_to_hub = conf.get("push_to_hub", False)
+hf_repo_id = conf.get("hf_repo_id", None)
+
+
+def upload_checkpoint(api, repo_id, local_path):
+    filename = os.path.basename(local_path)
+    try:
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=f"checkpoints/{filename}",
+            repo_id=repo_id,
+            repo_type="model",
+        )
+    except Exception as e:
+        print(f"WARNING: failed to upload {filename} to {repo_id}: {e}")
+
 
 def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", str(conf.world_size)))
@@ -373,7 +396,7 @@ def setup_distributed():
 
 
 def reduce_loss(total_loss, batch_count, training_device):
-    values = torch.tensor([total_loss, batch_count], dtype=torch.float64, device=training_device)
+    values = torch.tensor([total_loss, batch_count], dtype=torch.float32, device=training_device)
     if dist.is_initialized():
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return (values[0] / values[1]).item()
@@ -414,28 +437,8 @@ def nan_hook(module, inp, out):
         raise RuntimeError(f"NaN in {module}")
 
 import datetime
-if log_to_wandb and int(os.environ.get("RANK", "0")) == 0:
-    # Initialize wandb
-    run = wandb.init(
-        # Set the wandb entity where your project will be logged (generally your team name).
-        entity="anuragkompalli",
-        # Set the wandb project where this run will be logged.
-        project="SequenceCompression",
-        name=f"SequenceCompression_Baseline_{datetime.date.today()}",
-        # Track hyperparameters and run metadata.
-        config={
-            "learning_rate": lr,
-            "architecture": "Transformer",
-            "dataset": conf.datapath,
-            "epochs": n_epochs,
-            "num_frames": num_frames,
-            "max_hop_length": max_hop_length,
-            "batch_size": batch_size,
-            **(conf.__dict__)
-        },
-    )
 
-# -- Training loop -- 
+# -- Training loop --
 def train():
     global sigreg_term
     distributed, rank, training_device = setup_distributed()
@@ -443,9 +446,54 @@ def train():
     if is_main_process:
         print(f"Training on {training_device}")
 
-    pixel_preprocessor = AutoImageProcessor.from_pretrained(conf.pixel_preprocessor.model_name)
-    config = AutoConfig.from_pretrained(conf.pixel_encoder.model_name)
-    pixel_encoder = AutoModel.from_config(config)
+    hf_api = None
+    hf_executor = None
+    if push_to_hub and is_main_process:
+        if not hf_repo_id:
+            print("WARNING: push_to_hub is enabled but hf_repo_id is not set; skipping hub sync")
+        else:
+            hf_api = HfApi()
+            hf_api.create_repo(repo_id=hf_repo_id, repo_type="model", private=True, exist_ok=True)
+            # Single worker keeps uploads in epoch order without blocking the training loop.
+            hf_executor = ThreadPoolExecutor(max_workers=1)
+
+    run = None
+    if log_to_wandb and is_main_process:
+        # Initialize wandb. This must stay inside train() (called only from the
+        # `if __name__ == "__main__"` guard below), not at module level - on macOS, DataLoader
+        # worker subprocesses (num_workers > 0) re-execute this module's top-level code when
+        # they spawn, so a module-level wandb.init() call fires again in every worker process,
+        # producing a new run per worker on every script launch.
+        run = wandb.init(
+            # Set the wandb entity where your project will be logged (generally your team name).
+            entity="anuragkompalli",
+            # Set the wandb project where this run will be logged.
+            project="SequenceCompression",
+            name=f"SequenceCompression_Baseline_{datetime.date.today()}",
+            # Track hyperparameters and run metadata.
+            config={
+                "learning_rate": lr,
+                "architecture": "Transformer",
+                "dataset": conf.datapath,
+                "epochs": n_epochs,
+                "num_frames": num_frames,
+                "max_hop_length": max_hop_length,
+                "batch_size": batch_size,
+                **(conf.__dict__)
+            },
+        )
+
+    # Taken from original le-wm codebase
+    pixel_preprocessor =  Compose(
+        [
+            ToImage(),
+            ToDtype(torch.float32, scale=True),
+            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # 
+            Resize(size=224),
+        ]
+    )
+    
+    pixel_encoder = vit_hf("tiny", patch_size=14)
 
     train_loader, val_loader, train_sampler = action_dataloader(
         conf.datapath,
@@ -520,10 +568,8 @@ def train():
             if is_main_process and log_to_wandb:
                 run.log({
                     "train/loss": loss.item(),
-                    "train/hop_mse_loss": preds["hop_mse_loss"].item(),
-                    "train/chain_cosine_loss": preds["chain_cosine_loss"].item(),
-                    "train/action_sigreg_loss": preds["action_sigreg_loss"].item(),
-                    "train/obs_sigreg_loss": preds["obs_sigreg_loss"].item(),
+                    "train/prediction_loss": preds["prediction_loss"].item(),
+                    "train/prediction_sigreg": preds["prediction_sigreg"].item(),
                 }, step=global_step)
             global_step += 1
 
@@ -560,7 +606,15 @@ def train():
                 }
 
             os.makedirs("checkpoints", exist_ok=True)
-            torch.save(state_dict, f"checkpoints/lewm_epoch_{epoch}.pt")
+            ckpt_path = f"checkpoints/lewm_epoch_{epoch}.pt"
+            torch.save(state_dict, ckpt_path)
+
+            if hf_executor is not None:
+                hf_executor.submit(upload_checkpoint, hf_api, hf_repo_id, ckpt_path)
+
+    if hf_executor is not None:
+        # Block until the last submitted upload finishes so the process doesn't exit mid-upload.
+        hf_executor.shutdown(wait=True)
 
     if distributed:
         dist.destroy_process_group()

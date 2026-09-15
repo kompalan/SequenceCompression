@@ -5,11 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ale-py>=0.12.1",
     "datasets>=5.0.1",
     "einops>=0.8.2",
     "evotorch>=0.6.1",
     "h5py>=3.16.0",
     "hdf5plugin>=7.0.0",
+    "huggingface-hub>=1.28.0",
     "imageio>=2.37.4",
     "imageio-ffmpeg>=0.6.0",
     "ipywidgets>=8.1.9",
@@ -30,6 +32,7 @@ dependencies = [
 [project.scripts]
 train = "sequence_compression:train"
 eval = "sequence_compression:eval"
+train_decoder = "sequence_compression:train_observation_decoder"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

@@ -8,11 +8,108 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from einops import rearrange
 
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoImageProcessor, AutoModel, ViTConfig, ViTModel
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
     return x * (1 + scale) + shift
+
+# vit_hf, taken from stable_pretraining
+def vit_hf(
+    size: str = "tiny",
+    patch_size: int = 16,
+    image_size: int = 224,
+    pretrained: bool = False,
+    use_mask_token: bool = True,
+    **kwargs,
+) -> nn.Module:
+    """Create a Vision Transformer using HuggingFace transformers.
+
+    This provides a clean, well-maintained ViT implementation with native support for:
+    - Masking via bool_masked_pos parameter
+    - Learnable mask token
+    - Easy access to CLS and patch tokens
+
+    Args:
+        size: Model size - "tiny", "small", "base", or "large"
+        patch_size: Patch size (default: 16)
+        image_size: Input image size (default: 224)
+        pretrained: Load pretrained weights from HuggingFace Hub
+        use_mask_token: Whether to include learnable mask token (needed for iBOT)
+        **kwargs: Additional ViTConfig parameters
+
+    Returns:
+        HuggingFace ViTModel
+
+    Example:
+        >>> backbone = vit_hf("tiny", use_mask_token=True)
+        >>> x = torch.randn(2, 3, 224, 224)
+        >>>
+        >>> # Without masking
+        >>> output = backbone(x)
+        >>> cls_token = output.last_hidden_state[:, 0, :]
+        >>> patch_tokens = output.last_hidden_state[:, 1:, :]
+        >>>
+        >>> # With masking (for iBOT student)
+        >>> masks = torch.zeros(2, 196, dtype=torch.bool)
+        >>> masks[:, :59] = True  # Mask 30%
+        >>> output = backbone(x, bool_masked_pos=masks)
+    """
+
+    # ViT size configurations (matching timm/DINOv3)
+    size_configs = {
+        "tiny": {"hidden_size": 192, "num_hidden_layers": 12, "num_attention_heads": 3},
+        "small": {
+            "hidden_size": 384,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 6,
+        },
+        "base": {
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+        },
+        "large": {
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+        },
+        "huge": {
+            "hidden_size": 1280,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+        },
+    }
+
+    if size not in size_configs:
+        raise ValueError(
+            f"Invalid size '{size}'. Choose from {list(size_configs.keys())}"
+        )
+
+    config_params = size_configs[size]
+    config_params["intermediate_size"] = config_params["hidden_size"] * 4
+    config_params["image_size"] = image_size
+    config_params["patch_size"] = patch_size
+    config_params.update(kwargs)
+
+    if pretrained:
+        # Try to load pretrained model from HF Hub
+        model_name = f"google/vit-{size}-patch{patch_size}-{image_size}"
+        # logging.info(f"Loading pretrained ViT from {model_name}")
+        model = ViTModel.from_pretrained(
+            model_name, add_pooling_layer=False, use_mask_token=use_mask_token
+        )
+    else:
+        config = ViTConfig(**config_params)
+        model = ViTModel(config, add_pooling_layer=False, use_mask_token=use_mask_token)
+        # logging.info(f"Created ViT-{size} from scratch with config: {config_params}")
+
+    # IMPORTANT: Set model to always interpolate position encodings for dynamic input sizes
+    # This allows processing images of different sizes (e.g., 224x224 global + 96x96 local views)
+    # Must be set as instance attribute, not in config
+    model.config.interpolate_pos_encoding = True
+
+    return model
 
 class SIGReg(nn.Module):
     def __init__(self, knots=17, num_proj=1024):
@@ -412,7 +509,7 @@ class Transpressor(nn.Module):
         self.decoder = TransformerDecoder(
             input_dim, hidden_dim, condition_dim, 
             depth, heads, dim_head, mlp_dim, 
-            sequence_dim=sequence_dim, out_proj=output_proj
+            sequence_dim=sequence_dim, out_proj=output_proj, dropout=dropout
         )
         
     def encode(self, x, lengths=None):
@@ -464,15 +561,10 @@ class JEPA(nn.Module):
     def encode_pixels(self, pixels):
         """
         pixels: (B, T, C, H, W) - a chain of T observation frames, already resized/cropped/
-        normalized by the real HF preprocessor (done in chain_collate_fn, inside the
-        DataLoader workers, so this CPU-bound step overlaps with GPU compute instead of
-        blocking the forward pass).
+        rescaled/normalized by the real HF preprocessor (channel-first, as it produces them).
         Returns CLS-pooled, per-frame embeddings: (B, T, hidden_size).
         """
-        batch, timestep, h, w, c = pixels.shape
-
-        # Channel must be first
-        pixels = pixels.transpose(4, 2)
+        batch, timestep, c, h, w = pixels.shape
 
         images = pixels.reshape(batch * timestep, c, h, w)
 
@@ -489,7 +581,7 @@ class JEPA(nn.Module):
 
     def predict(self, pixels, hop_input, hop_lengths=None):
         """
-        pixels: (B, T, H, W, C) - the chain's T observation frames.
+        pixels: (B, T, C, H, W) - the chain's T observation frames.
         hop_input: (B*(T-1), max_len, action_dim) - the T-1 hops between them, flattened.
         hop_lengths: (B*(T-1),) - each hop's true (START + actions) length.
         """
@@ -570,17 +662,17 @@ class JEPA(nn.Module):
         """
         # goal_emb = goal_emb.unsqueeze(1).expand_as(predicted_emb)  # (B, S, dim)
 
-        # cost = F.mse_loss(
-        #     predicted_emb,
-        #     goal_emb.detach(),
-        #     reduction="none",
-        # ).sum(dim=-1)  # (B, S)
-
-        cost = 1 - F.cosine_similarity(
+        cost = F.mse_loss(
             predicted_emb,
             goal_emb.detach(),
-            dim=-1,
-        )  # (B, S)
+            reduction="none",
+        ).sum(dim=-1)  # (B, S)
+
+        # cost = 1 - F.cosine_similarity(
+        #     predicted_emb,
+        #     goal_emb.detach(),
+        #     dim=-1,
+        # )  # (B, S)
 
         return cost
 
@@ -611,7 +703,6 @@ class JEPA(nn.Module):
             pixels[0].unsqueeze(0), action_embs
         )  # (B, S, D)
 
-  
         goal_emb = self.encode_pixels(goal[0].unsqueeze(0)) # (B, D)
 
         predicted_emb = predicted_emb.reshape(B, S, -1)
