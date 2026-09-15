@@ -1,5 +1,7 @@
 n_epochs: 100
 lr: 1e-5
+min_lr: 1e-6
+warmup_steps: 1000
 batch_size: 128
 num_frames: 4
 max_hop_length: 1

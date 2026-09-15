@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, random_split
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from .module import JEPA, ARPredictor, NaiveActionEmbedder, SIGReg, vit_hf
 
@@ -340,6 +340,8 @@ conf = OmegaConf.load("config/transpressor_baseline.yaml")
 
 n_epochs = conf.n_epochs
 lr = conf.lr
+min_lr = conf.get("min_lr", 0.0)
+warmup_steps = conf.get("warmup_steps", 0)
 batch_size = conf.batch_size
 num_frames = conf.num_frames
 max_hop_length = conf.max_hop_length
@@ -546,6 +548,15 @@ def train():
 
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=lr)
 
+    total_steps = n_epochs * len(train_loader)
+    warmup = min(warmup_steps, total_steps)
+    if warmup > 0:
+        warmup_scheduler = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup, eta_min=min_lr)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup])
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=min_lr)
+
     global_step = 0
     for epoch in range(n_epochs):
         if train_sampler is not None:
@@ -563,6 +574,7 @@ def train():
 
             loss.backward()
             optimizer.step()
+            scheduler.step()
             train_loss += loss.item()
 
             if is_main_process and log_to_wandb:
@@ -570,6 +582,7 @@ def train():
                     "train/loss": loss.item(),
                     "train/prediction_loss": preds["prediction_loss"].item(),
                     "train/prediction_sigreg": preds["prediction_sigreg"].item(),
+                    "train/learning_rate": scheduler.get_last_lr()[0],
                 }, step=global_step)
             global_step += 1
 
@@ -591,7 +604,7 @@ def train():
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "learning_rate": lr
+                "learning_rate": scheduler.get_last_lr()[0]
             })
         elif is_main_process:
             print(f"Epoch {epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}")
