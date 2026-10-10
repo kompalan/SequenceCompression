@@ -40,6 +40,8 @@ Here's a little video I made with Claude to better explain what I'm trying to te
 
 ## Related Work
 
+- [ACT](https://arxiv.org/abs/2304.13705): A seminal paper in learning manipulation through demonstration. They also use fixed length chunks rather than planning single actions.
+
 - [Accelerating Reinforcement Learning with Learned Skill Priors](https://arxiv.org/abs/2010.11944): Extremely close to what I'm trying here! The authors try to extract "skills" from prior interaction data and train a network to propose relevant skills based on observations. The authors show that doing this results in much better performance on robotic manipulation in the D4RL kitchen environment.
 
 ## Architecture
